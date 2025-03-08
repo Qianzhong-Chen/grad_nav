@@ -39,10 +39,16 @@ In this paper, we present a GPU-based differentiable simulation and propose a po
 3. **Update Configuration:**
 - Modify lines **4-14** in:
   ```
-  .../envs/assets/gs_data/map_name/splatfacto/time/config.yml
+  GRaD_Nav_internal/envs/assets/gs_data/map_name/splatfacto/time/config.yml
   ```
 - Set the corresponding paths to your **3DGS data folder** manually.
 
+## Create a new branch and check out
+
+```
+git branch <branch_name>
+git checkout <branch_name>
+```
 
 ## Training
 - Checkout <.github/launch.json>, it is highly recommended to use VSCode debugger
@@ -58,12 +64,12 @@ Same as above.
 If you find our paper or code is useful, please consider citing:
 ```kvk
   @misc{chen2025gradnavefficientlylearningvisual,
-                title={GRaD-Nav: Efficiently Learning Visual Drone Navigation with Gaussian Radiance Fields and Differentiable Dynamics}, 
-                author={Qianzhong Chen and Jiankai Sun and Naixiang Gao and JunEn Low and Timothy Chen and Mac Schwager},
-                year={2025},
-                eprint={2503.03984},
-                archivePrefix={arXiv},
-                primaryClass={cs.RO},
-                url={https://arxiv.org/abs/2503.03984}, 
-            }
+        title={GRaD-Nav: Efficiently Learning Visual Drone Navigation with Gaussian Radiance Fields and Differentiable Dynamics}, 
+        author={Qianzhong Chen and Jiankai Sun and Naixiang Gao and JunEn Low and Timothy Chen and Mac Schwager},
+        year={2025},
+        eprint={2503.03984},
+        archivePrefix={arXiv},
+        primaryClass={cs.RO},
+        url={https://arxiv.org/abs/2503.03984}, 
+    }
 ```
