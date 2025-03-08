@@ -25,6 +25,11 @@ In this paper, we present a GPU-based differentiable simulation and propose a po
   pip install gsplat
   ```
 
+- Install gym
+  ```
+  pip install gym
+  ```
+
 ## Data Download and Setup
 
 1. **Download Required Data:**
