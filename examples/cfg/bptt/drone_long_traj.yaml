@@ -1,0 +1,78 @@
+params:  
+  diff_env:
+    name: DroneLongTrajEnv
+    stochastic_env: True
+    episode_length: 600
+    MM_caching_frequency: 16
+
+  algo:
+    name: adam 
+
+  network:
+    actor: ActorStochasticMLP #ActorDeterministicMLP
+    actor_mlp:
+      units: [512, 256, 128]
+      activation: elu
+
+    critic: CriticMLP
+    critic_mlp:
+      units: [512, 256, 128]
+      # units: [128, 128]
+      activation: elu
+
+  vae:
+    kl_weight: 1.0
+    velo_weight: 1.0
+
+  config:
+    name: drone_bptt
+    map_name: gate_mid # [gate_mid, clutter]
+    actor_learning_rate: 1e-4 # adam
+    critic_learning_rate: 1e-4 # adam
+    vae_learning_rate: 5e-4
+    vel_net_learning_rate: 5e-4
+    lr_schedule: cosine # ['constant', 'linear', 'cosine']
+    target_critic_alpha: 0.2
+    curriculum: False
+    obs_rms: True
+    ret_rms: False
+    critic_iterations: 16
+    critic_method: td-lambda # ['td-lambda', 'one-step']
+    lambda: 0.95 # init 0.95
+    num_batch: 4
+    gamma: 0.99 # 0.99
+    betas: [0.7, 0.95] # adam
+    steps_num: 600
+    grad_norm: 1.0
+    truncate_grads: True
+    num_actors: 8
+    save_interval: 10
+    max_epochs: 1000 # total training iterations
+
+    rew_norm: False
+    rew_momentum: 0.9
+
+    multi_stage: False
+    stage_change_time: 800
+
+    vel_net_early_stop: True
+    vel_net_stop_time: 200
+
+    # pretrain vel_net
+    pretrain_vel_net: False
+    pretrain_epoch: 30
+    pretrain_steps_num: 50
+
+    domain_randomization: True
+
+    # LPF
+    LPF_train: True
+    LPF_val: 0.5
+
+    player:
+      determenistic: True
+      games_num: 1
+      num_actors: 1
+      print_stats: True
+      LPF_eval: True
+      LPF_val: 0.5

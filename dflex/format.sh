@@ -1,1 +1,0 @@
-yapf --recursive --in-place .

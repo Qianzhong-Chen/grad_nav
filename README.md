@@ -17,7 +17,7 @@ In this paper, we present a GPU-based differentiable simulation and propose a po
 
 #### Prerequisites
 
-- install nerfstudio (refer to the [link](https://github.com/nerfstudio-project/nerfstudio)), by default, using nerfstudio conda env for future development.
+- Configure [nerfstudio](https://github.com/nerfstudio-project/nerfstudio), by default, using nerfstudio conda env for future development.
 
 - Confirm all 3DGS packages have been installed
   ```
@@ -25,40 +25,28 @@ In this paper, we present a GPU-based differentiable simulation and propose a po
   pip install gsplat
   ```
 
-- Download [3DGS data](https://drive.google.com/drive/folders/1nx2JLNtK6uSJuDX8HUS75eTrn6gfR0jG?usp=sharing) and [point cloud data](https://drive.google.com/drive/folders/1nx2JLNtK6uSJuDX8HUS75eTrn6gfR0jG?usp=sharing) to
+## Data Download and Setup
+
+1. **Download Required Data:**
+   - [3DGS Data](https://drive.google.com/drive/folders/1nx2JLNtK6uSJuDX8HUS75eTrn6gfR0jG?usp=sharing)
+   - [Point Cloud Data](https://drive.google.com/drive/folders/1nx2JLNtK6uSJuDX8HUS75eTrn6gfR0jG?usp=sharing)
+
+2. **Place the downloaded folders in:**
+  <GRaD_Nav_internal/envs/assets/>
+
+
+
+3. **Update Configuration:**
+- Modify lines **4-14** in:
   ```
-  GRaD_Nav_internal/envs/assets/
+  .../envs/assets/gs_data/map_name/splatfacto/time/config.yml
   ```
+- Set the corresponding paths to your **3DGS data folder** manually.
 
-- Set up [wandb](https://docs.wandb.ai/quickstart/) or comment out related code
-<!-- - dflex
-
-  ```
-  cd dflex
-  pip install -e .
-  ``` -->
-
-<!-- - gym 
-
-  ```
-  pip install gym
-  ``` -->
-
-<!-- 
-#### Test Examples
-
-A test example can be found in the `examples` folder.
-
-```
-python test_env.py --env AntEnv
-```
-
-If the console outputs `Finish Successfully` in the last line, the code installation succeeds.
- -->
 
 ## Training
-Checkout <.github/launch.json>, it is highly recommended to use VSCode debugger
-
+- Checkout <.github/launch.json>, it is highly recommended to use VSCode debugger
+- Set up [wandb](https://docs.wandb.ai/quickstart/) (highly recommended) or comment out related code
 
 
 ## Testing

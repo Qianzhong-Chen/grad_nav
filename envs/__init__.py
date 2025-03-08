@@ -6,11 +6,10 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 from envs.dflex_env import DFlexEnv
-from envs.quadrotor_gs_traj_global_8 import QuadrotorGSMaskPosTrajGlobal8Env
-from envs.quadrotor_gs_traj_global_no_diff import QuadrotorGSMaskPosTrajGlobalNoDiffEnv
-from envs.quadrotor_gs_traj_global_ppo import QuadrotorGSMaskPosTrajGlobalPPOEnv
-from envs.quadrotor_gs_traj_global_multi_gate import QuadrotorGSMaskPosTrajGlobalMultiGateEnv
-from envs.quadrotor_gs_traj_global_paper_test import QuadrotorGSMaskPosTrajGlobalPaperTestEnv
+from envs.drone_long_traj import DroneLongTrajEnv
+from envs.drone_ppo import DronePPOEnv
+from envs.drone_multi_gate import DroneMultiGateEnv
+from envs.drone_paper_test import DronePaperTestEnv
 
 
 
