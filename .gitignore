@@ -1,0 +1,40 @@
+*.log
+*.npy
+*.pyc
+*.ckpt
+*.pt
+*.usd
+*.pyc
+*.ply
+*.mustafar
+*.cpython-38.pyc
+examples/logs
+examples/wandb
+examples/runs
+examples/outputs
+
+
+algorithms/__pycache__
+# /envs/*
+*.pyc
+envs/__pycache__/
+
+# Ignore .log files in examples/wandb directory
+examples/wandb/*.log
+
+# Ignore all files in examples/wandb directory
+examples/wandb/*
+
+# Ignore files in nerf_install/nerfstudio.egg-info
+nerf_install/nerfstudio.egg-info/
+
+
+*.png
+*.mp4
+*.ninja
+*.obj
+
+/wandb
+
+envs/assets/gs_data
+envs/assets/point_cloud

@@ -1,0 +1,1110 @@
+# Copyright (c) 2022 NVIDIA CORPORATION.  All rights reserved.
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+
+from envs.dflex_env import DFlexEnv
+import math
+import torch
+torch.autograd.set_detect_anomaly(True)
+
+from torchvision import models, transforms
+from torchvision.transforms import Resize
+from torchvision.io import write_video
+import torch.nn as nn
+import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from pathlib import Path
+from rich.console import Console
+from PIL import Image
+from envs.assets.quadrotor_dynamics_noise import QuadrotorSimulator
+# from envs.assets.visiual_buffer import VisualBuffer
+
+import numpy as np
+np.set_printoptions(precision=5, linewidth=256, suppress=True)
+
+# try:
+#     from pxr import Usd
+# except ModuleNotFoundError:
+#     print("No pxr package")
+
+# from utils import load_utils as lu
+from utils import torch_utils as tu
+from utils.common import *
+from utils.gs_local import GS, get_gs
+from utils.rotation import dynamic_to_nerf_quaternion_batch, pose_transfer_ns, pose_transfer_ns_batched, quaternion_to_euler
+from utils.model_util import quat_from_axis_angle, transform, quat_from_axis_angle_batch
+from utils.model import ModelBuilder
+from utils.point_cloud_util import ObstacleDistanceCalculator
+from utils.traj_planner_global import TrajectoryPlanner
+from utils.hist_obs_buffer import ObsHistBuffer
+import time
+import matplotlib.pyplot as plt
+# squeezenet + trainable linear layer
+import torchvision.models as models
+
+SINGLE_VISUAL_INPUT_SIZE = 24
+HISTORY_BUFFER_NUM = 5
+LATENT_VECT_NUM = 16
+
+class VisualPerceptionNet(nn.Module):
+    def __init__(self, input_channels=4):
+        super(VisualPerceptionNet, self).__init__()
+        # Set up the SqueezeNet backbone
+        self.squeezenet = models.squeezenet1_0(pretrained=True)
+        
+        # Modify the first convolution layer to accept more channels (e.g., 4 for RGB + Depth)
+        self.squeezenet.features[0] = nn.Conv2d(input_channels, 96, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+
+        # Freeze SqueezeNet parameters so they are not updated during training
+        for param in self.squeezenet.parameters():
+            param.requires_grad = False
+
+        # Add an adaptive average pooling to get the output to [batch_size, 512, 1, 1]
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        # Add a 1D convolution layer to downsample from 512 to 32
+        self.conv1d = nn.Conv1d(512, SINGLE_VISUAL_INPUT_SIZE, kernel_size=1)
+        # self.fc = nn.Linear(512, SINGLE_VISUAL_INPUT_SIZE)
+
+    def forward(self, x):
+        # Freeze the SqueezeNet layers but keep the 1D convolution layer trainable
+        with torch.no_grad():
+            x = self.squeezenet.features(x)  # SqueezeNet backbone is frozen
+            x = self.pool(x)  # Adaptive pooling to reduce spatial dimensions to 1x1
+        x = torch.flatten(x, 1)  # Flatten to shape [batch_size, 512]
+        
+        # Conv
+        x = x.unsqueeze(-1)  # Add a channel dimension for 1D convolution
+        x = self.conv1d(x).squeeze(-1)  # Apply 1D convolution and remove the extra dimension
+        
+        # FC layer
+        # x = self.fc(x)
+
+        return x
+
+
+class QuadrotorGSMaskPosTrajGlobalNoDiffEnv(DFlexEnv):
+
+    def __init__(self, 
+                 render=False, 
+                 device='cuda:0', 
+                 num_envs=4096, 
+                 seed=0, 
+                 episode_length=1000, 
+                 no_grad=True, 
+                 stochastic_init=False, 
+                 MM_caching_frequency = 1, 
+                 early_termination = True, 
+                 map_name='gate_mid'
+                 ):
+       
+        self.num_privilege_obs = 30 + SINGLE_VISUAL_INPUT_SIZE + LATENT_VECT_NUM
+        num_obs = 22 + SINGLE_VISUAL_INPUT_SIZE + LATENT_VECT_NUM # correspond with self.obs_buf
+        num_act = 4
+        self.agent_name = 'quadrotor_gs_mask_pos_traj_global_no_diff'
+        self.num_history = HISTORY_BUFFER_NUM
+        self.num_latent = LATENT_VECT_NUM
+    
+        print('----------------------------', device)
+        super(QuadrotorGSMaskPosTrajGlobalNoDiffEnv, self).__init__(num_envs, num_obs, num_act, episode_length, MM_caching_frequency, seed, no_grad, render, device)
+        self.stochastic_init = stochastic_init
+        self.early_termination = early_termination
+        self.device = device
+        self.height_target = 1.2
+
+        # setup map
+        maps = {
+            "gate_left":"sv_917_3_left_nerfstudio",
+            "gate_right":"sv_917_3_right_nerfstudio",
+            "gate_mid":"sv_1007_gate_mid",
+            "clutter":"sv_712_nerfstudio",
+            "backroom":"sv_1018_2",
+            "flightroom":"sv_1018_3",
+        }
+        self.map_name = map_name
+
+        self.init_sim()
+        self.episode_length = episode_length
+
+        # GS model
+        gs_dir = Path(
+        "/home/david/DiffRL_NeRF/envs/assets/gs_data"
+        )
+        resolution_quality = 0.4
+        self.gs = get_gs(self.map_name, gs_dir, resolution_quality)
+        
+
+        # navigation parameters
+
+        
+        if self.map_name == 'gate_mid':
+            target = (12.0, -2.3, 1.2) # in map absolute dimension, start with 0
+            target_xy = (12.0, -2.3)
+        if self.map_name == 'clutter':
+            target = (12.0, -2.3, 1.2) # in map absolute dimension, start with 0
+            target_xy = (12.0, -2.3)
+        self.target = tu.to_torch(list(target), 
+            device=self.device, requires_grad=True).repeat((self.num_envs, 1)) # navigation target
+        self.target_xy = tu.to_torch(list(target_xy), 
+            device=self.device, requires_grad=True).repeat((self.num_envs, 1)) # navigation target
+        # self.target_list = self.target.clone()
+        self.gs_init_pos = torch.tensor([[-7.0, -0., -0.]] * self.num_envs, device=self.device) # (x,y,z); gs dimension for visual info
+        self.point_could_init_pos = torch.tensor([[-6.0, -0., -0.]] * self.num_envs, device=self.device) # (x,y,z); point cloud dimension for obstacle distance & traj plan
+
+        # setup point cloud
+        point_cloud_dir = Path(
+        "/home/david/DiffRL_NeRF/envs/assets/point_cloud"
+        )
+        self.point_cloud = ObstacleDistanceCalculator(ply_file=os.path.join(point_cloud_dir,f'{maps[self.map_name]}.ply'))
+        self.traj_planner = TrajectoryPlanner(ply_file=os.path.join(point_cloud_dir,f'{maps[self.map_name]}.ply'), 
+                                            safety_distance=0.25, 
+                                            batch_size=1, 
+                                            wp_distance=2.0,
+                                            verbose=False)
+        
+        # generate ref_traj
+        if self.map_name == 'gate_mid':
+            self.reward_wp = torch.tensor([[5.8, -0.1, 1.4], 
+                                        [9.5, 1.5, 0.6], 
+                                        [11.5, 0.0, 1.2],
+                                        [12.0, -2.3, 1.2]], device=self.device) # (x,y,z)
+            
+            
+            # plane the global ref trajectory
+            traj_wp = self.reward_wp + self.point_could_init_pos[0].repeat((self.reward_wp.shape[0],1))
+            traj_start = torch.tensor([[-6.0, 0, 1.2]], device=self.device)
+            traj_dest = torch.tensor([[6.0, -2.3, 1.2]], device=self.device)
+            self.ref_traj = self.traj_planner.plan_trajectories(traj_start, traj_dest, [traj_wp])
+            self.ref_traj = torch.tensor(self.ref_traj[0], device = self.device)
+        
+        if self.map_name == 'clutter':
+            self.reward_wp = torch.tensor([
+                              [1.1, -0.6, 1.4],
+                              [6.1, -1.7, 0.6],
+                              [9.4, 1.5, 1.2],
+                              [12.0, -2.3, 1.2]], device=self.device)
+            # plane the global ref trajectory
+            traj_wp = self.reward_wp + self.point_could_init_pos[0].repeat((self.reward_wp.shape[0],1))
+            traj_start = torch.tensor([[-6.0, 1.0, 1.2]], device=self.device)
+            traj_dest = torch.tensor([[6.0, -2.3, 1.2]], device=self.device)
+            self.ref_traj = self.traj_planner.plan_trajectories(traj_start, traj_dest, [traj_wp])
+            self.ref_traj = torch.tensor(self.ref_traj[0], device = self.device)
+        
+        
+        
+        self.reward_wp_list = [self.reward_wp + self.point_could_init_pos[0].repeat((self.reward_wp.shape[0],1))] * self.num_envs
+        self.reward_wp_record = []
+        for i in range(self.reward_wp.shape[0]):
+            self.reward_wp_record.append(torch.zeros(self.num_envs, dtype=torch.bool, device=self.device))
+        
+        
+        
+        # Other parameters
+        if self.map_name == 'gate_mid':
+            # ## Original way
+            # self.termination_distance = 1000
+            # self.action_strength = 1.0 # only act on body rate
+            # self.joint_vel_obs_scaling = 0.1
+            self.up_strength = 0.1
+            self.heading_strength = 0.3 # reward yaw motion align with lin_vel
+            self.lin_strength = -0.3
+            self.yaw_strength = 0.0
+            self.action_penalty = -0.5
+            self.action_change_penalty = -0.4
+            # self.ang_vel_penalty = -0.4
+            # self.ang_acc_penalty = -0.005
+            self.survive_reward = 8.0
+            self.height_penalty = -2.0
+            self.height_change_penalty = -0.1
+            self.jitter_penalty = -0.1
+            self.out_map_penalty = -1.5
+            self.map_center_penalty = -0.05
+            # trajectory
+            self.waypoint_strength = 1.8
+            self.target_factor = -3.
+            # obstacle avoidance
+            self.obstacle_strength = 0.3
+            self.collision_penalty_coef = 0.0
+            self.collision_penalty = self.collision_penalty_coef*self.survive_reward 
+        
+        if self.map_name == 'clutter':
+            # ## Original way
+            # self.termination_distance = 1000
+            # self.action_strength = 1.0 # only act on body rate
+            # self.joint_vel_obs_scaling = 0.1
+            self.up_strength = 0.1
+            self.heading_strength = 0.3 # reward yaw motion align with lin_vel
+            self.lin_strength = -0.4
+            self.yaw_strength = 0.0
+            self.action_penalty = -0.4
+            self.action_change_penalty = -0.4
+            # self.ang_vel_penalty = -0.4
+            # self.ang_acc_penalty = -0.005
+            self.survive_reward = 8.0
+            self.height_penalty = -2.0
+            self.height_change_penalty = -0.1
+            self.jitter_penalty = -0.1
+            self.out_map_penalty = -1.5
+            self.map_center_penalty = -0.15
+            # trajectory
+            self.waypoint_strength = 1.5
+            self.target_factor = -2.
+            # obstacle avoidance
+            self.obstacle_strength = 0.3
+            self.collision_penalty_coef = 0.0
+            self.collision_penalty = self.collision_penalty_coef*self.survive_reward 
+
+        # self.depth_strength = 2.5
+        self.control_base = 0.327 # hover thrust
+        self.obst_threshold = 0.5
+        self.obst_collision_limit = 0.20
+        self.body_rate_threshold = 15
+
+        
+        # reward function adjusting
+        self.survive_disc_start = 400
+        self.lin_rev_start = 1000
+
+        self.dt = 0.05 # outter loop RL policy freaquency
+        self.map_limit_fact = 1.25
+        self.map_x_min = -1.5; self.map_x_max = 13
+        self.map_y_min = -2.5; self.map_y_max = 2.5
+        
+
+        self.nerf_count = 0
+        self.nerf_freq = 1 # inference nerf every # steps
+        self.depth_list = 0
+        self.condition_approach = 4
+        self.training_stage = 0
+
+        self.traj_planning_count = 0
+        
+
+        #-----------------------
+        # Set up visual perception net
+        self.visual_net = VisualPerceptionNet().to(self.device)
+        self.obs_hist_buf = ObsHistBuffer(batch_size=self.num_envs,
+                                          vector_dim=self.num_obs,
+                                          buffer_size=HISTORY_BUFFER_NUM,
+                                          device=self.device,
+                                          )
+
+
+        # pack for record
+        self.hyper_parameter = {
+            # "termination_distance": self.termination_distance,
+            # "action_strength": self.action_strength,
+            # "joint_vel_obs_scaling": self.joint_vel_obs_scaling,
+            "up_strength": self.up_strength,
+            "heading_strength": self.heading_strength,
+            "lin_strength": self.lin_strength,
+            "obstacle_strength": self.obstacle_strength,
+            "obst_collision_limit": self.obst_collision_limit,
+            "action_penalty": self.action_penalty,
+            # "target_penalty": self.target_penalty,
+            "target_factor": self.target_factor,
+            # "ang_vel_penalty": self.ang_vel_penalty,
+            # "ang_acc_penalty": self.ang_acc_penalty,
+            "obst_threshold": self.obst_threshold,
+            "survive_reward": self.survive_reward,
+            "height_penalty": self.height_penalty,
+            "height_change_penalty": self.height_change_penalty,
+            "sim_dt": self.dt,
+            "collision_penalty": self.collision_penalty,
+            "waypoint_strength": self.waypoint_strength,
+            "jitter_penalty":self.jitter_penalty,
+            "map_center_penalty": self.map_center_penalty,
+            "out_map_penalty": self.out_map_penalty,
+            "collision_penalty_coef":self.collision_penalty_coef,
+            "condition_approach": self.condition_approach,
+            "yaw_strength": self.yaw_strength,
+            "action_change_penalty": self.action_change_penalty,
+        }
+        
+        #-----------------------
+        # set up Visualization
+        self.time_stamp = get_time_stamp()
+        self.episode_count = 0
+        if (self.visualize):
+            curr_path = os.getcwd()
+            self.save_path = f'{curr_path}/examples/outputs/{self.agent_name}/{self.map_name}/{self.time_stamp}'
+            os.makedirs(self.save_path, exist_ok=True)
+
+           
+        # recored x, y, depth for test
+        self.x_record = []
+        self.y_record = []
+        self.z_record = []
+        self.roll_record = []
+        self.pitch_record = []
+        self.yaw_record = []
+        self.velo_x_record = []
+        self.velo_y_record = []
+        self.velo_z_record = []
+        self.ang_velo_x_record = []
+        self.ang_velo_y_record = []
+        self.ang_velo_z_record = []
+        self.vae_velo_x_record = []
+        self.vae_velo_y_record = []
+        self.vae_velo_z_record = []
+        self.depth_record = []
+        self.img_record = []
+        self.action_record = np.zeros([self.episode_length,4])
+        
+
+    def init_sim(self):
+        # self.builder = df.sim.ModelBuilder()
+        self.builder = ModelBuilder()
+        self.dt = 0.05 # outter loop RL policy freaquency
+        self.sim_dt = self.dt
+        self.ground = True
+
+        self.num_joint_q = 11 # action(4) + position(3) + pose(4)
+        self.num_joint_qd = 10
+
+        self.x_unit_tensor = tu.to_torch([1, 0, 0], dtype=torch.float, device=self.device, requires_grad=False).repeat((self.num_envs, 1))
+        self.y_unit_tensor = tu.to_torch([0, 1, 0], dtype=torch.float, device=self.device, requires_grad=False).repeat((self.num_envs, 1))
+        self.z_unit_tensor = tu.to_torch([0, 0, 1], dtype=torch.float, device=self.device, requires_grad=False).repeat((self.num_envs, 1))
+
+        if self.map_name == 'gate_mid':
+            self.start_rot = np.array([0., 0., 0., 1.]) # (x,y,z,w)
+        if self.map_name == 'clutter':
+            # self.start_rot = np.array([0., 0., 0.707, 0.707]) # (x,y,z,w), rpy (0,0,pi/2)
+            self.start_rot = np.array([0.0, 0.0, 0.382683, 0.923879]) # (x,y,z,w), rpy (0,0,pi/4)
+
+        self.start_rotation = tu.to_torch(self.start_rot, device=self.device, requires_grad=False)
+
+        # initialize some data used later on
+        # todo - switch to z-up
+        self.up_vec = self.z_unit_tensor.clone()
+        self.heading_vec = self.x_unit_tensor.clone()
+        self.inv_start_rot = tu.quat_conjugate(self.start_rotation).repeat((self.num_envs, 1))
+
+        # self.basis_vec0 = self.heading_vec.clone()
+        # self.basis_vec1 = self.up_vec.clone()
+
+        self.mass = 1.  # kg
+        self.max_thrust = 30.
+        self.hover_thrust = self.mass * 9.81 
+        
+        
+        inertia = torch.tensor([0.005, 0.005, 0.01])  # Diagonal inertia tensor components
+        link_length = 0.15  # meters
+        self.quad_dynamics = QuadrotorSimulator(
+                                mass=self.mass,
+                                inertia=torch.diag(inertia),
+                                link_length=link_length,
+                                Kp=torch.tensor([1.0, 1.0, 2.0]),
+                                Kd=torch.tensor([0.03, 0.03, 0.04]),
+                                freq=200.0,
+                                max_thrust=self.max_thrust,  # Maximum thrust in Newtons
+                                total_time=self.sim_dt,  # Total simulation time in seconds
+                                rotor_noise_std=0.01,  # Standard deviation for rotor control noise
+                                br_noise_std=0.005
+                            )
+        
+        if self.map_name == 'gate_mid':
+            # start_pos_x = -0.5; start_pos_y = 0.5
+            # start_pos_x = 0.5; start_pos_y = 0.5
+            start_pos_x = 0.0; start_pos_y = 0.0
+            self.start_body_rate = [0., 0., 0.]
+        if self.map_name == 'clutter':
+            start_pos_x = -0.5; start_pos_y = 1.0
+            self.start_body_rate = [0., 0., 0.]
+
+        self.start_height = 1.2
+        self.start_pos = []
+        # self.start_body_rate = [0., 0., 0.] # r,p,y
+        self.start_norm_thrust = [self.hover_thrust / self.max_thrust]
+        self.start_action = self.start_body_rate + self.start_norm_thrust
+        
+        
+        # if self.visualize:
+        #     self.env_dist = 2.5
+        # else:
+        #     self.env_dist = 0. # set to zero for training for numerical consistency
+        
+
+        for i in range(self.num_environments):
+            # start_pos_y = i*self.env_dist
+            start_pos = [start_pos_x, start_pos_y, self.start_height, ]
+            self.start_pos.append(start_pos)
+
+        # start_x variables for reseting drones       
+        self.start_pos = tu.to_torch(self.start_pos, device=self.device)
+        self.start_pos_backup = self.start_pos.clone()
+        self.start_joint_q = tu.to_torch(self.start_action, device=self.device)
+        self.start_joint_target = tu.to_torch(self.start_action, device=self.device)
+        self.prev_thrust = torch.ones([self.num_envs, 1], device=self.device) * (self.hover_thrust / self.max_thrust)
+        
+        # initialize action with hover thrust
+        self.actions = self.start_joint_q.repeat(self.num_envs,1).clone()
+        self.prev_actions = self.actions.clone()
+        # initialize state variables
+        self.state_joint_q = torch.zeros([self.num_envs, 7], device=self.device) # pos + quat
+        self.state_joint_qd = torch.zeros([self.num_envs, 6], device=self.device) # lin_velo + ang_velo
+        self.state_joint_qdd = torch.zeros([self.num_envs, 6], device=self.device) # lin_acc + ang_acc
+        
+
+
+
+        self.latent_vect = torch.zeros([self.num_envs, LATENT_VECT_NUM], device=self.device, dtype = torch.float)
+        self.lin_vel_vae = torch.zeros([self.num_envs, 3], device=self.device, dtype = torch.float)
+
+    
+    def step(self, actions, vae_info, vel_net_info):
+        self.latent_vect, _ = vae_info[0].clone().detach(), vae_info[1].clone().detach()
+        self.lin_vel_vae = vel_net_info[0].clone().detach()
+
+        # prepare vae data
+        self.obs_hist_buf.update(self.obs_buf)
+        obs_hist = self.obs_hist_buf.get_concatenated().clone().detach()
+        obs_vel = self.privilege_obs_buf[:, 3:6].clone().detach()
+
+        actions = actions.view((self.num_envs, self.num_actions))
+        body_rate_cols = torch.clip(actions[:, 0:3], -1., 1.)
+        thrust_col = torch.clip(actions[:, 3:],-1., 1.) * 0.2 + self.control_base
+
+        actions = torch.cat([body_rate_cols, thrust_col], dim=1)
+        self.prev_actions = self.actions.clone()
+        self.actions = actions # normalized
+        control_input = (actions[:, 0:3], actions[:, 3])
+        
+        torso_pos = self.state_joint_q.view(self.num_envs, -1)[:, 0:3] # (x,z,y)
+        torso_quat = self.state_joint_q.view(self.num_envs, -1)[:, 3:7] # rotated 90 deg
+        lin_vel = self.state_joint_qd.view(self.num_envs, -1)[:, 3:6] # joint_qd rot has 3 entries
+        ang_vel = self.state_joint_qd.view(self.num_envs, -1)[:, 0:3]
+        lin_acc = self.state_joint_qdd.view(self.num_envs, -1)[:, 3:6] # joint_qd rot has 3 entries
+        ang_acc = self.state_joint_qdd.view(self.num_envs, -1)[:, 0:3]
+        # torso_quat = tu.quat_mul(torso_rot, self.inv_start_rot)
+
+        # if self.episode_count > 70:
+        #     print(self.episode_count)
+        
+        new_position, new_linear_velocity, new_angular_velocity, new_quaternion, new_linear_acceleration, new_angular_acceleration = self.quad_dynamics.run_simulation(
+        position=torso_pos,
+        velocity=lin_vel,
+        orientation=torso_quat[:, [3,0,1,2]],
+        angular_velocity=ang_vel,
+        control_input=control_input
+    )
+        
+        # detach all states from simulator
+        new_position = new_position.detach()
+        new_linear_velocity = new_linear_velocity.detach()
+        new_angular_velocity = new_angular_velocity.detach()
+        new_quaternion = new_quaternion.detach()
+        new_linear_acceleration = new_linear_acceleration.detach()
+        new_angular_acceleration = new_angular_acceleration.detach()
+
+        # set new state back
+        self.state_joint_q.view(self.num_envs, -1)[:, 0:3] = new_position
+        self.state_joint_q.view(self.num_envs, -1)[:, 3:7] = new_quaternion[:, [1,2,3,0]].clone()
+        self.state_joint_qd.view(self.num_envs, -1)[:, 3:6] = new_linear_velocity
+        self.state_joint_qd.view(self.num_envs, -1)[:, 0:3] = new_angular_velocity
+        self.state_joint_qdd.view(self.num_envs, -1)[:, 3:6] = new_linear_acceleration.clone().detach()
+        self.state_joint_qdd.view(self.num_envs, -1)[:, 0:3] = new_angular_acceleration.clone().detach()
+        # joint_qdd = self.state_joint_qdd.view(self.num_envs, -1).clone()  # Clone the tensor to avoid in-place operation
+        # joint_qdd[:, 3:6] = new_linear_acceleration
+        # joint_qdd[:, 0:3] = new_angular_acceleration
+        # self.state_joint_qdd = joint_qdd.view_as(self.state_joint_qdd)  # Assign it back
+
+        self.sim_time += self.sim_dt
+        self.reset_buf = torch.zeros_like(self.reset_buf)
+
+        self.progress_buf += 1
+        self.num_frames += 1
+
+        self.calculateObservations()
+        self.calculateReward()
+
+        env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+
+        if self.no_grad == False:
+            self.obs_buf_before_reset = self.obs_buf.clone()
+            self.privilege_obs_buf_before_reset = self.privilege_obs_buf.clone()
+            self.extras = {
+                'obs_before_reset': self.obs_buf_before_reset,
+                'privilege_obs_before_reset': self.privilege_obs_buf_before_reset,
+                'episode_end': self.termination_buf,
+                }
+
+        if len(env_ids) > 0:
+           self.reset(env_ids)
+
+        # self.render()
+        if (torch.isnan(obs_hist).any() | torch.isinf(obs_hist).any()):
+            print('obs hist nan')
+            obs_hist = torch.nan_to_num(obs_hist, nan=0.0, posinf=1e3, neginf=-1e3)
+        if (torch.isnan(obs_vel).any() | torch.isinf(obs_vel).any()):
+            print('obs vel nan')
+            obs_vel = torch.nan_to_num(obs_vel, nan=0.0, posinf=1e3, neginf=-1e3)
+        
+
+        return self.obs_buf, self.privilege_obs_buf, obs_hist, obs_vel, self.rew_buf, self.reset_buf, self.extras
+    
+    def change_curriculum(self, type):
+        if type == 0:
+            self.start_pos = self.start_pos_backup.clone()
+        elif type == 1:
+            self.start_pos = self.reward_wp[0].repeat(self.num_envs,1)
+            return self.start_pos[0]
+        elif type == 2:
+            self.start_pos = self.reward_wp[1].repeat(self.num_envs,1)
+            return self.start_pos[0]
+        elif type == 3:
+            self.start_rot = quat_from_axis_angle((0.707, -0.707, 0.0), -math.pi*0.5)
+            self.start_rotation = tu.to_torch(self.start_rot, device=self.device, requires_grad=False)
+            return self.start_rotation
+
+    def reset(self, env_ids = None, force_reset = True):
+        if env_ids is None:
+            if force_reset == True:
+                env_ids = torch.arange(self.num_envs, dtype=torch.long, device=self.device)
+
+        if env_ids is not None:
+            
+            # clone the state to avoid gradient error
+            self.state_joint_q = self.state_joint_q.clone()
+            self.state_joint_qd = self.state_joint_qd.clone()
+            self.state_joint_qdd = self.state_joint_qdd.clone()
+
+            # fixed start state
+            self.state_joint_q[env_ids, 0:3] = self.start_pos[env_ids, :].clone()
+            self.state_joint_q.view(self.num_envs, -1)[env_ids, 3:7] = self.start_rotation.clone()
+            # self.state_joint_q.view(self.num_envs, -1)[env_ids, 7:] = self.start_joint_q.clone()
+            self.state_joint_qd.view(self.num_envs, -1)[env_ids, :] = 0.
+            self.state_joint_qdd.view(self.num_envs, -1)[env_ids, :] = 0.
+            self.actions.view(self.num_envs, -1)[env_ids, :] = self.start_joint_q.clone()
+            self.prev_actions.view(self.num_envs, -1)[env_ids, :] = self.start_joint_q.clone()
+
+            # randomization
+            if self.stochastic_init:
+                self.state_joint_q.view(self.num_envs, -1)[env_ids, 0:3] = self.state_joint_q.view(self.num_envs, -1)[env_ids, 0:3] + 0.1 * (torch.rand(size=(len(env_ids), 3), device=self.device) - 0.5) * 2.
+                angle = (torch.rand(len(env_ids), device = self.device) - 0.5) * np.pi / 12.
+                axis = torch.nn.functional.normalize(torch.rand((len(env_ids), 3), device = self.device) - 0.5)
+                self.state_joint_q.view(self.num_envs, -1)[env_ids, 3:7] = tu.quat_mul(self.state_joint_q.view(self.num_envs, -1)[env_ids, 3:7], tu.quat_from_angle_axis(angle, axis))
+                # self.state_joint_q.view(self.num_envs, -1)[env_ids, 7:] = self.state_joint_q.view(self.num_envs, -1)[env_ids, 7:] + 0.2 * (torch.rand(size=(len(env_ids), self.num_joint_q - 7), device = self.device) - 0.5) * 2.
+                self.state_joint_qd.view(self.num_envs, -1)[env_ids, :] = 0.5 * (torch.rand(size=(len(env_ids), 6), device=self.device) - 0.5)
+                self.state_joint_qdd.view(self.num_envs, -1)[env_ids, :] = 0.05 * (torch.rand(size=(len(env_ids), 6), device=self.device) - 0.5)
+                self.actions.view(self.num_envs, -1)[env_ids, :] = self.start_joint_q.clone() + 0.05 * (torch.rand(size=(len(env_ids), 4), device=self.device))
+                self.prev_actions.view(self.num_envs, -1)[env_ids, :] = self.start_joint_q.clone()
+            
+            # clear action
+            # self.actions = self.actions.clone()
+            # self.actions[env_ids, :] = torch.zeros((len(env_ids), self.num_actions), device = self.device, dtype = torch.float)
+            # self.prev_actions = self.prev_actions.clone()
+            # self.prev_actions[env_ids, :] = torch.zeros((len(env_ids), self.num_actions), device = self.device, dtype = torch.float)
+
+            # clear VAE variables
+            self.latent_vect = torch.zeros([self.num_envs, LATENT_VECT_NUM], device=self.device, dtype = torch.float)
+            self.lin_vel_vae = torch.zeros([self.num_envs, 3], device=self.device, dtype = torch.float)
+
+            self.progress_buf[env_ids] = 0
+            self.calculateObservations()
+
+        return self.obs_buf
+    
+    '''
+    cut off the gradient from the current state to previous states
+    '''
+    def clear_grad(self, checkpoint = None):
+        with torch.no_grad():
+            if checkpoint is None:
+                checkpoint = {}
+                checkpoint['joint_q'] = self.state_joint_q.clone()
+                checkpoint['joint_qd'] = self.state_joint_qd.clone()
+                checkpoint['actions'] = self.actions.clone()
+                checkpoint['prev_actions'] = self.prev_actions.clone()
+                checkpoint['progress_buf'] = self.progress_buf.clone()
+                checkpoint['latent_vect'] = self.latent_vect.clone()
+                checkpoint['lin_vel_vae'] = self.lin_vel_vae.clone()
+
+            current_joint_q = checkpoint['joint_q'].clone()
+            current_joint_qd = checkpoint['joint_qd'].clone()
+            # self.state = self.model.state()
+            self.state_joint_q = current_joint_q
+            self.state_joint_qd = current_joint_qd
+            self.actions = checkpoint['actions'].clone()
+            self.prev_actions = checkpoint['prev_actions'].clone()
+            self.progress_buf = checkpoint['progress_buf'].clone()
+            self.latent_vect = checkpoint['latent_vect'].clone()
+            self.lin_vel_vae = checkpoint['lin_vel_vae'].clone()
+
+    '''
+    This function starts collecting a new trajectory from the current states but cuts off the computation graph to the previous states.
+    It has to be called every time the algorithm starts an episode and it returns the observation vectors
+    '''
+    def initialize_trajectory(self):
+        self.clear_grad()
+        self.calculateObservations()
+
+        return self.obs_buf, self.privilege_obs_buf
+
+    def get_checkpoint(self):
+        checkpoint = {}
+        checkpoint['joint_q'] = self.state_joint_q.clone()
+        checkpoint['joint_qd'] = self.state_joint_qd.clone()
+        checkpoint['actions'] = self.actions.clone()
+        checkpoint['prev_actions'] = self.prev_actions.clone()
+        checkpoint['progress_buf'] = self.progress_buf.clone()
+        checkpoint['latent_vect'] = self.latent_vect.clone()
+        checkpoint['lin_vel_vae'] = self.lin_vel_vae.clone()
+
+        return checkpoint
+    
+    def process_nerf_data(self, depth_list, nerf_img):
+        # min depth from nerf
+        batch,H,W,ch = depth_list.shape
+        depth_list_up = depth_list[:,0:int(H/2),:,:]
+        self.depth_list = torch.abs(torch.amin(depth_list_up,dim=(1,2,3))) 
+        self.depth_list = self.depth_list.unsqueeze(1)
+        self.depth_list = self.depth_list.to(device=self.device)
+        # rgb from nerf
+        input_tensor = nerf_img.permute(0, 3, 1, 2)
+        depth_tensor = depth_list.permute(0, 3, 1, 2)  # Make sure depth_list is [batch_size, channels, height, width]
+        # Concatenate RGB image and depth data along the channel dimension
+        combined_tensor = torch.cat([input_tensor, depth_tensor], dim=1)
+        # Resize to match ResNet18 input size
+        resize = nn.AdaptiveAvgPool2d((224, 224))
+        combined_tensor = resize(combined_tensor)
+        combined_tensor = combined_tensor.to(self.device)
+        self.visual_info = self.visual_net(combined_tensor)
+        self.visual_info = self.visual_info.detach()
+        
+
+
+    def calculateObservations(self):
+        torso_pos = self.state_joint_q.view(self.num_envs, -1)[:, 0:3]
+        torso_quat = self.state_joint_q.view(self.num_envs, -1)[:, 3:7] # (x,y,z,w)
+        lin_vel = self.state_joint_qd.view(self.num_envs, -1)[:, 3:6] # joint_qd rot has 3 entries
+        ang_vel = self.state_joint_qd.view(self.num_envs, -1)[:, 0:3]
+
+        # convert the linear velocity of the torso from twist representation to the velocity of the center of mass in world frame
+        lin_vel_new = lin_vel - torch.cross(torso_pos, ang_vel, dim=-1).detach().clone()
+        # lin_vel = torch.clamp(lin_vel.clone(), min=-1e6, max=1e6)
+        # self.lin_vel_vae = torch.clamp(self.lin_vel_vae.clone(), min=-1e6, max=1e6)
+
+        to_target =  + self.start_pos - torso_pos
+        to_target[:, 2] = 0.0
+        
+        # target_dirs = tu.normalize(to_target)
+        target_dirs = tu.normalize(lin_vel[:, 0:2].clone())
+        up_vec = tu.quat_rotate(torso_quat.clone(), self.up_vec)
+        up_vec_ablation = torch.zeros_like(up_vec)
+        # heading_vec = tu.quat_rotate(torso_quat, self.heading_vec)
+        rpy = quaternion_to_euler(torso_quat[:, [3,0,2,1]]) # input is (w,x,z,y)
+        heading_vec = torch.cat([torch.cos(rpy[:,2].unsqueeze(-1)), torch.sin(rpy[:,2].unsqueeze(-1))], dim=1) 
+
+        # Parallized implementation
+        # gs_quat = torso_quat # (x, y, z, w)
+        gs_pos = torso_pos + self.gs_init_pos # (x, y, z)
+        gs_pos[:, 1] = -gs_pos[:, 1]
+        gs_pos[:, 2] = -gs_pos[:, 2]
+        gs_pose = torch.cat([gs_pos, torch.zeros([self.num_envs, 3], device = self.device), torso_quat], dim=-1)
+        rpy_data = rpy.clone().detach().cpu().numpy()
+
+
+        if not self.visualize:
+            # Nerf info processing
+            if self.nerf_count % self.nerf_freq == 0: # infer nerf every nerf_freq steps
+                depth_list, nerf_img = self.gs.render(gs_pose) # (batch_size,H,W,1/3)
+                self.process_nerf_data(depth_list, nerf_img)
+            self.nerf_count += 1            
+            
+        # Draw record plot for data visualization
+        if self.visualize:
+            img_transform = Resize((360, 640), antialias=True)
+
+            # ---------------------------------------
+            # Normal test mode
+            # NeRF data
+            depth_list, nerf_img = self.gs.render(gs_pose) # (batch_size,H,W,1/3)
+            self.process_nerf_data(depth_list, nerf_img)
+
+            # Visualization
+            # rgb from nerf
+            nerf_img = torch.permute(nerf_img[0], (2,0,1))
+            img = img_transform(nerf_img)
+
+            pos_data = torso_pos.clone()
+            pos_data = pos_data.detach().cpu().numpy()
+            depth_data = self.depth_list.clone()
+            depth_data = depth_data.detach().cpu().numpy()
+            action_data = self.actions.clone().detach().cpu().numpy()
+            ang_vel_data = ang_vel.clone().detach().cpu().numpy()
+            # velo_data = lin_vel_new.clone().detach().cpu().numpy()
+            vae_velo_data = self.lin_vel_vae.clone().detach().cpu().numpy()
+            velo_data = lin_vel.clone().detach().cpu().numpy()
+
+            self.x_record.append(pos_data[0, 0])
+            self.y_record.append(pos_data[0, 1])
+            self.z_record.append(pos_data[0, 2])
+            self.roll_record.append(rpy_data[0, 0])
+            self.pitch_record.append(rpy_data[0, 1])
+            self.yaw_record.append(rpy_data[0, 2])
+            self.velo_x_record.append(velo_data[0, 0])
+            self.velo_y_record.append(velo_data[0, 1])
+            self.velo_z_record.append(velo_data[0, 2])
+            self.ang_velo_x_record.append(ang_vel_data[0, 0])
+            self.ang_velo_y_record.append(ang_vel_data[0, 1])
+            self.ang_velo_z_record.append(ang_vel_data[0, 2])
+            self.vae_velo_x_record.append(vae_velo_data[0, 0])
+            self.vae_velo_y_record.append(vae_velo_data[0, 1])
+            self.vae_velo_z_record.append(vae_velo_data[0, 2])
+            self.depth_record.append(depth_data[0]/2)
+            self.img_record.append(img)
+            if self.episode_count < self.episode_length:
+                self.action_record[self.episode_count,:] = action_data
+            self.episode_count += 1
+
+        
+        self.latent_abalation = torch.zeros_like(self.latent_vect)
+        torso_rot_ablation = torch.zeros_like(torso_quat)
+        ang_vel_ablation = torch.zeros_like(ang_vel)
+        lin_acceleration = self.state_joint_qdd.view(self.num_envs, -1)[:, 3:6]
+        ang_acceleration = self.state_joint_qdd.view(self.num_envs, -1)[:, 0:3]
+        self.privilege_obs_buf = torch.cat([
+                                torso_pos[:, :], # 0:3 
+                                # lin_vel_new, # 3:6
+                                lin_vel,
+                                lin_acceleration, # acc 6:9 
+                                torso_quat, # 9:13
+                                ang_vel, # 13:16
+                                # up_vec[:, 1:2], # 16
+                                up_vec_ablation[:, 1:2],
+                                (heading_vec * target_dirs).sum(dim = -1).unsqueeze(-1), # 17
+                                self.actions, # 18:22
+                                self.prev_actions, # 22:26
+                                self.depth_list, # 26
+                                self.visual_info, # 27:51
+                                # self.latent_abalation
+                                self.latent_vect, # 51:67
+                                # ang_acceleration, # 59:62
+                                self.lin_vel_vae,
+                                ], 
+                                dim = -1)
+        
+        if self.training_stage == 0:
+            self.obs_buf = torch.cat([
+                                    torso_pos[:, 2].unsqueeze(-1), # z-pos 0
+                                    # lin_vel_new[:, 2].unsqueeze(-1), # z-vel 1
+                                    lin_vel[:, 2].unsqueeze(-1),
+                                    lin_acceleration[:, 2].unsqueeze(-1), # z-acc 2
+
+                                    torso_quat, # 3:7
+                                    # torso_rot_ablation,
+
+                                    # ang_vel, # 7:10
+                                    ang_vel_ablation,
+
+                                    # up_vec[:, 1:2], # 10
+                                    up_vec_ablation[:, 1:2],
+
+                                    self.actions, # 11:15
+                                    self.prev_actions, # 15:19
+                                    # self.lin_vel_vae, # 19:22
+                                    lin_vel,
+                                    self.visual_info, # 22:46
+                                    # self.latent_abalation
+                                    self.latent_vect, # 46:62
+                                    ], 
+                                    dim = -1)
+        else:
+            self.obs_buf = torch.cat([
+                                    torso_pos[:, 2].unsqueeze(-1), # z-pos 0
+                                    # lin_vel_new[:, 2].unsqueeze(-1), # z-vel 1
+                                    lin_vel[:, 2].unsqueeze(-1),
+                                    lin_acceleration[:, 2].unsqueeze(-1), # z-acc 2
+                                    torso_quat, # 3:7
+                                    # torso_rot_ablation,
+                                    ang_vel, # 7:10
+                                    # up_vec[:, 1:2], # 10
+                                    up_vec_ablation[:, 1:2],
+                                    self.actions, # 11:15
+                                    self.prev_actions, # 15:19
+                                    self.lin_vel_vae, # 19:22
+                                    # lin_vel,
+                                    self.visual_info, # 22:46
+                                    # self.latent_abalation
+                                    self.latent_vect, # 46:62
+                                    ], 
+                                    dim = -1)
+        
+        # ugly fix of simulation (usually z_acc inf) 
+        if (torch.isnan(self.obs_buf).any() | torch.isinf(self.obs_buf).any()):
+            print('nan')
+            self.obs_buf = torch.nan_to_num(self.obs_buf, nan=0.0, posinf=1e3, neginf=-1e3)
+
+        if (torch.isnan(self.privilege_obs_buf).any() | torch.isinf(self.privilege_obs_buf).any()):
+            print('nan')
+            self.privilege_obs_buf = torch.nan_to_num(self.privilege_obs_buf, nan=0.0, posinf=1e3, neginf=-1e3)
+
+        # # ## used for adding breakpoint
+        # print(self.episode_count)
+        # if self.episode_count % 40 == 0:
+        #     print(self.episode_count)
+
+    def calculateReward(self):
+        # torso_pos = self.state_joint_q.view(self.num_envs, -1)[:, 0:3]
+        # torso_rot = self.state_joint_q.view(self.num_envs, -1)[:, 3:7]
+        torso_pos = self.privilege_obs_buf[:, 0:3]
+        # torso_rot = self.obs_buf[:, 3:7]
+        torso_quat = self.obs_buf[:, 3:7] # (x,y,z,w)
+        drone_rot = torso_quat # (x, y, z, w)
+        drone_pos = torso_pos + self.point_could_init_pos # in point cloud dimension
+        drone_target = self.target + self.point_could_init_pos
+
+        # make yaw angle align with velocity
+        target_dirs = tu.normalize(self.privilege_obs_buf[:, [3,5]])
+        rpy = rpy = quaternion_to_euler(torso_quat[:, [3,0,2,1]]) # input is (w,x,z,y)
+        heading_vec = torch.cat([torch.cos(rpy[:,2].unsqueeze(-1)), torch.sin(rpy[:,2].unsqueeze(-1))], dim=1) 
+        yaw_alignment = (heading_vec * target_dirs).sum(dim = -1)
+
+        # Compute ref_x for all environments
+        ref_x = self.privilege_obs_buf[:, 0] + self.point_could_init_pos[0, 0]  # Shape: [num_envs]
+        ref_traj_x = self.ref_traj[:, 0]  # Shape: [ref_traj_length]
+        diff = ref_traj_x.unsqueeze(0) - ref_x.unsqueeze(1)  # Shape: [num_envs, ref_traj_length]
+        mask = diff > 0.5  # Shape: [num_envs, ref_traj_length]
+        diff_masked = torch.where(mask, diff, float('inf'))  # Shape: [num_envs, ref_traj_length]
+        min_diffs, min_indices = torch.min(diff_masked, dim=1)  # Shapes: [num_envs], [num_envs]
+        no_valid_indices = torch.isinf(min_diffs)  # Shape: [num_envs]
+        target_list = torch.empty((self.num_envs, 3), device=self.device)
+        default_target = self.target[0] + self.point_could_init_pos[0]  # Shape: [3]
+        target_list[:] = default_target
+        valid_indices = ~no_valid_indices
+        selected_indices = min_indices[valid_indices]
+        targets = self.ref_traj[selected_indices]  # Shape: [num_valid_envs, 3]
+        target_list[valid_indices] = targets
+        target_list = target_list - self.point_could_init_pos
+
+
+
+        # ## Original way
+        survive_reward = self.survive_reward
+        up_reward = self.up_strength * self.obs_buf[:, 10]
+        heading_reward = self.heading_strength * yaw_alignment
+        # lin_vel_reward = self.lin_strength * torch.linalg.norm(self.privilege_obs_buf[:, 3:5], dim=1) 
+        # lin_vel_reward = self.lin_strength * torch.linalg.norm(self.obs_buf[:, 19:21], dim=1) 
+        lin_vel_reward = self.lin_strength * torch.sum(torch.square(self.obs_buf[:, 19:21]), dim=-1) 
+        # ang_vel_penalty = torch.sum(torch.square(self.obs_buf[:, 7:10]), dim = -1) * self.ang_vel_penalty
+        # ang_vel_penalty = torch.linalg.norm(self.obs_buf[:, 7:10], dim=1) * self.ang_vel_penalty
+        # ang_vel_penalty = torch.linalg.norm(self.obs_buf[:, 7:9], dim=1) * self.ang_vel_penalty # not penalty yaw
+        # ang_acc_penalty = torch.linalg.norm(self.obs_buf[:, 51:54], dim=1) * self.ang_acc_penalty
+        action_penalty = torch.sum(torch.square(self.obs_buf[:, 11:15]), dim = -1) * self.action_penalty # penalty on force
+        action_penalty += torch.square(self.obs_buf[:, 14]) * self.yaw_strength
+        action_change_penalty = torch.sum(torch.square((self.obs_buf[:, 11:15] - self.obs_buf[:, 15:19])), dim = -1) * self.action_change_penalty # penalty on force
+        # height_penalty = torch.abs(self.obs_buf[:,0] - self.height_target) * self.height_penalty
+        height_penalty = torch.square(self.obs_buf[:,0] - self.height_target) * self.height_penalty
+        height_change_penalty = self.height_change_penalty * torch.square(self.obs_buf[:,1])
+        jitter_penalty = self.jitter_penalty * torch.square(self.obs_buf[:,2])
+        out_map_penalty = self.out_map_penalty * (
+            torch.clamp(self.map_x_min - self.privilege_obs_buf[:, 0], min=0) ** 2 +
+            torch.clamp(self.privilege_obs_buf[:, 0] - self.map_x_max, min=0) ** 2 +
+            torch.clamp(self.map_y_min - self.privilege_obs_buf[:, 1], min=0) ** 2 +
+            torch.clamp(self.privilege_obs_buf[:, 1] - self.map_y_max, min=0) ** 2
+        )
+        map_center_penalty = self.map_center_penalty * torch.square(self.privilege_obs_buf[:,2])
+
+        wp_reward = torch.zeros(self.num_envs, device=self.device)
+        for i, waypoint in enumerate(self.reward_wp):
+            waypoint = waypoint.repeat((self.num_envs,1))
+            distances = torch.norm(self.privilege_obs_buf[:, 0:3] - waypoint, dim=1)**2
+            factor = (torch.exp(1 / (distances+torch.ones(self.num_envs, device=self.device))) - torch.ones(self.num_envs, device=self.device)) # 0-1
+            # factor = torch.exp(-distances) # 0-1
+            wp_reward += factor * self.waypoint_strength
+
+        
+        
+        desire_velo_norm = (target_list - self.privilege_obs_buf[:, 0:3]) / torch.clamp(torch.norm(target_list - self.privilege_obs_buf[:, 0:3], dim=1, keepdim=True), min=1e-6)
+        curr_velo_norm = self.obs_buf[:, 19:22] / torch.clamp(torch.norm(self.obs_buf[:, 19:22], dim=1, keepdim=True), min=1e-2)
+        # velo_dist = torch.linalg.norm(curr_velo_norm[:, [0,2]] - desire_velo_norm[:, [0,2]], dim=1)
+        velo_dist = torch.linalg.norm(curr_velo_norm - desire_velo_norm, dim=1)
+        target_reward = velo_dist * self.target_factor
+
+        # target_dist = torch.linalg.norm(self.privilege_obs_buf[:, 0:3] - target_list, dim=1)**2
+        # target_dist = torch.linalg.norm(self.privilege_obs_buf[:, [0,2]] - target_list[:, [0,2]], dim=1)**2
+        # target_reward = target_dist * self.target_factor
+        # target_reward = self.target_factor * torch.exp(-target_dist)
+
+        # dist to obstacle based on ground truth
+        obst_reward = torch.tensor([0.], requires_grad=True, device=self.device)
+        obst_dist = self.point_cloud.compute_nearest_distances(drone_pos, drone_rot)
+        # reward larger distance away from obstacles
+        obst_reward = obst_reward + torch.where(obst_dist < self.obst_threshold, obst_dist*self.obstacle_strength, torch.zeros_like(obst_dist))
+        # penalty collision
+        obst_reward = obst_reward + torch.where(obst_dist < self.obst_collision_limit, torch.ones_like(obst_dist)*self.collision_penalty, torch.zeros_like(obst_dist))
+        
+        self.rew_buf = (
+                        survive_reward + 
+                        obst_reward + 
+                        # ang_vel_penalty + 
+                        # ang_acc_penalty +
+                        lin_vel_reward + 
+                        up_reward + 
+                        heading_reward + 
+                        target_reward + 
+                        action_penalty + 
+                        action_change_penalty +
+                        height_penalty + 
+                        out_map_penalty + 
+                        map_center_penalty +
+                        height_change_penalty +
+                        jitter_penalty +
+                        wp_reward 
+                        )
+            
+        
+        # reset agents
+        condition_dist = (obst_dist < self.obst_collision_limit)
+        condition_loss = (self.rew_buf < -10)
+        # condition_senity = ~(((self.obs_buf > -1000) & (self.obs_buf < 1000) & ~torch.isnan(self.obs_buf)& ~torch.isinf(self.obs_buf)).all(dim=1))
+        condition_senity = ~(( ~torch.isnan(self.obs_buf)& ~torch.isinf(self.obs_buf)).all(dim=1))
+        condition_body_rate = torch.linalg.norm(self.privilege_obs_buf[:,10:13], dim=1) > self.body_rate_threshold
+        condition_height = (self.privilege_obs_buf[:,2] > 4.) | (self.privilege_obs_buf[:,2] < 0.)
+        condition_out_of_bounds = (
+            (self.privilege_obs_buf[:, 0] < self.map_limit_fact * self.map_x_min) |
+            (self.privilege_obs_buf[:, 0] > self.map_limit_fact * self.map_x_max) |
+            (self.privilege_obs_buf[:, 1] < self.map_limit_fact * self.map_y_min) |
+            (self.privilege_obs_buf[:, 1] > self.map_limit_fact * self.map_y_max)
+        )
+        condition_train = self.progress_buf > self.episode_length - 1
+        combined_condition = condition_body_rate | condition_train
+        if self.early_termination:
+            if self.condition_approach == 1:
+                combined_condition = combined_condition | condition_senity | condition_loss
+            elif self.condition_approach == 2:
+                combined_condition = combined_condition | condition_height | condition_senity | condition_loss
+            elif self.condition_approach == 3:
+                combined_condition = condition_dist | condition_height | combined_condition
+            elif self.condition_approach == 4:
+                combined_condition = condition_height | combined_condition | condition_out_of_bounds | condition_senity
+        
+        # ## used for adding breakpoint
+        # if self.episode_count % 20 == 0:
+        # if self.episode_count > 140:
+        #     print(self.episode_count)
+
+        self.reset_buf = torch.where(combined_condition, torch.ones_like(self.reset_buf), self.reset_buf)
+
+        if self.visualize:
+            if self.episode_count == (self.episode_length-1) or combined_condition.any():
+                self.save_recordings()
+
+    def save_recordings(self):
+        save_path = self.save_path
+        np.save(f'{save_path}/x.npy', np.array(self.x_record, dtype=object), allow_pickle=True)
+        np.save(f'{save_path}/y.npy', np.array(self.y_record, dtype=object), allow_pickle=True)
+        np.save(f'{save_path}/z.npy', np.array(self.z_record, dtype=object), allow_pickle=True)
+
+        # # figure x over time
+        # plt.figure()
+        # plt.plot(range(len(self.x_record)), self.x_record)
+        # plt.xlabel("Step")
+        # plt.ylabel("X/m")
+        # plt.savefig(f'{save_path}/x_plot.png')
+
+        # # figure y over time
+        # plt.figure()
+        # plt.plot(range(len(self.y_record)), self.y_record)
+        # plt.xlabel("Step")
+        # plt.ylabel("Y/m")
+        # plt.savefig(f'{save_path}/y_plot.png')
+
+        # # figure z over time
+        plt.figure()
+        plt.plot(range(len(self.z_record)), self.z_record)
+        plt.xlabel("Step")
+        plt.ylabel("Z/m")
+        plt.savefig(f'{save_path}/z_plot.png')
+
+        # figure pose over time
+        plt.figure()
+        plt.plot(range(len(self.x_record)), self.x_record)
+        plt.plot(range(len(self.y_record)), self.y_record)
+        plt.plot(range(len(self.z_record)), self.z_record)
+        plt.xlabel("Step")
+        plt.ylabel("m")
+        plt.legend(['x', 'y', 'z'])
+        plt.savefig(f'{save_path}/pos_plot.png')
+
+        # figure traj 
+        wp_np = self.reward_wp.clone().detach().cpu().numpy()
+        target = self.target[0,:].clone().detach().cpu().numpy()
+        plt.figure()
+        plt.plot(self.x_record, self.y_record)
+
+        # draw waypoints
+        wp_num, _ = wp_np.shape
+        if wp_num > 0:
+            for i in range(wp_num-1):
+                circle = plt.Circle((wp_np[i][0], wp_np[i][1]), 0.3, color='b', fill=True)
+                plt.gca().add_patch(circle)
+            circle = plt.Circle((wp_np[-1][0], wp_np[-1][1]), 0.5, color='r', fill=True)
+            plt.gca().add_patch(circle)
+
+        plt.gca().set_aspect('equal', adjustable='box')
+        plt.xlabel("X/m")
+        plt.ylabel("Y/m")
+        plt.savefig(f'{save_path}/traj_plot.png')
+
+        # figure pose over time
+        plt.figure()
+        plt.plot(range(len(self.roll_record)), self.roll_record)
+        plt.plot(range(len(self.pitch_record)), self.pitch_record)
+        plt.plot(range(len(self.yaw_record)), self.yaw_record)
+        plt.xlabel("Step")
+        plt.ylabel("rad")
+        plt.legend(['r', 'p', 'y'])
+        plt.savefig(f'{save_path}/pose_plot.png')
+
+        # figure velo over time
+        plt.figure()
+        plt.plot(range(len(self.velo_x_record)), self.velo_x_record)
+        plt.plot(range(len(self.velo_y_record)), self.velo_y_record)
+        plt.plot(range(len(self.velo_z_record)), self.velo_z_record)
+        plt.plot(range(len(self.vae_velo_x_record)), self.vae_velo_x_record, linestyle='dashed')
+        plt.plot(range(len(self.vae_velo_y_record)), self.vae_velo_y_record, linestyle='dashed')
+        plt.plot(range(len(self.vae_velo_z_record)), self.vae_velo_z_record, linestyle='dashed')
+        plt.xlabel("Step")
+        plt.ylabel("m/s")
+        plt.legend(['vx', 'vy', 'vz', 'vae_vx', 'vae_vy', 'vae_vz'])
+        plt.savefig(f'{save_path}/velo_plot.png')
+
+
+        # figure depth 
+        plt.figure()
+        plt.plot(range(len(self.depth_record)), self.depth_record)
+        plt.xlabel("Step")
+        plt.ylabel("depth/m")
+        plt.savefig(f'{save_path}/depth_plot.png')
+
+        # figure action
+        plt.figure()
+        for action_id in range(3):
+            plt.plot(range(np.shape(self.action_record)[0]), self.action_record[:,action_id], label=f'rotor {action_id}') 
+        plt.plot(range(len(self.ang_velo_x_record)), self.ang_velo_x_record, linestyle='dashed')
+        plt.plot(range(len(self.ang_velo_y_record)), self.ang_velo_y_record, linestyle='dashed')
+        plt.plot(range(len(self.ang_velo_z_record)), self.ang_velo_z_record, linestyle='dashed')
+        plt.xlabel('Step')
+        plt.ylabel('body_rate')
+        plt.legend(['r_des', 'p_des', 'y_des', 'r', 'p', 'y'])
+        plt.savefig(f'{save_path}/body_rate_plot.png')
+
+        plt.figure()
+        plt.plot(range(np.shape(self.action_record)[0]), self.action_record[:,3]) 
+        plt.xlabel('Step')
+        plt.ylabel('normalized_force')
+        plt.savefig(f'{save_path}/action_force_plot.png')
+
+        # save video
+        video_tensor = torch.permute(torch.stack(self.img_record), (0, 2, 3, 1)) * 255
+        video_tensor = video_tensor.to('cpu')
+        video_tensor_uint8 = video_tensor.to(dtype=torch.uint8)
+        write_video(f'{save_path}/ego_video.mp4', video_tensor_uint8, fps=30)
+
+    

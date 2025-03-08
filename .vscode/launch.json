@@ -1,0 +1,165 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        
+        {
+            "name": "Train Quadrotor GS Traj Global 8",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_shac_5.py",
+            "args": [
+                "--cfg", "examples/cfg/shac_5/quadrotor_gs_traj_global_8.yaml",
+                "--logdir", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac",
+                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/gate_mid/01-10-2025-10-26-34/best_policy.pt",
+                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/clutter/01-12-2025-12-35-52/best_policy.pt",
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Test Quadrotor GS Traj Global 8",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_shac_5.py",
+            "args": [
+                "--cfg", "examples/cfg/shac_5/quadrotor_gs_traj_global_8.yaml", 
+                "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/gate_right/02-09-2025-03-57-30_SOTA/init_policy.pt",
+                "--play",
+                "--render"
+            ],
+            "console": "integratedTerminal"
+        },
+
+        {
+            "name": "Train Quadrotor GS Traj Global paper test",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_shac_5.py",
+            "args": [
+                "--cfg", "examples/cfg/shac_5/quadrotor_gs_traj_global_paper_test.yaml",
+                "--logdir", "examples/logs/QuadrotorGSMaskPosTrajGlobalPaperTest/shac",
+                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/gate_mid/01-10-2025-10-26-34/best_policy.pt",
+                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/clutter/01-12-2025-12-35-52/best_policy.pt",
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Test Quadrotor GS Traj Global paper test",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_shac_5.py",
+            "args": [
+                "--cfg", "examples/cfg/shac_5/quadrotor_gs_traj_global_paper_test.yaml", 
+                
+                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobalPaperTest/shac/gate_mid/02-16-2025-00-32-32/best_policy.pt",
+                "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobalPaperTest/shac/gate_right/02-19-2025-18-54-41/best_policy.pt",
+                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/clutter/01-12-2025-16-28-36/best_policy.pt",                
+                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/simple_hover/02-01-2025-16-46-09/final_policy.pt", 
+                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/gate_left/01-21-2025-02-57-44/policy_iter600_reward4358.036.pt",
+                "--play",
+                "--render"
+            ],
+            "console": "integratedTerminal"
+        },
+
+        {
+            "name": "Train Quadrotor GS Traj Global multi gate",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_shac_5.py",
+            "args": [
+                "--cfg", "examples/cfg/shac_5/quadrotor_gs_traj_global_multi_gate.yaml",
+                "--logdir", "examples/logs/QuadrotorGSMaskPosTrajGlobalMultiGate/shac",
+                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/gate_mid/01-10-2025-10-26-34/best_policy.pt",
+                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/clutter/01-12-2025-12-35-52/best_policy.pt",
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Test Quadrotor GS Traj Global multi gate",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_shac_5.py",
+            "args": [
+                "--cfg", "examples/cfg/shac_5/quadrotor_gs_traj_global_multi_gate.yaml", 
+                "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobalMultiGate/shac/gate_mid/03-05-2025-21-23-51/policy_iter1500_reward2831.889.pt",
+                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobalMultiGate/shac/gate_right/02-26-2025-10-57-40/final_policy.pt",
+                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobalMultiGate/shac/gate_left/03-03-2025-14-40-04/best_policy.pt",
+                "--play",
+                "--render"
+            ],
+            "console": "integratedTerminal"
+        },
+
+        {
+            "name": "Distill Policy",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_distill_policy.py",
+            "args": [
+                "--cfg", "examples/cfg/shac_5/quadrotor_gs_traj_global_8.yaml", 
+                "--teacher_dir", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/gate_right/01-27-2025-13-47-33",
+                "--policy_name", "best_policy.pt"
+            ],
+            "console": "integratedTerminal"
+        },
+
+
+        // baseline training with PPO
+        {
+            "name": "Train Quadrotor PPO",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_ppo.py",
+            "args": [
+                "--cfg", "examples/cfg/ppo/quadrotor_gs_traj_global_ppo.yaml",
+                "--logdir", "examples/logs/QuadrotorGSMaskPosTrajGlobalPPO/ppo",
+                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal7/shac/12-29-2024-23-43-38/best_policy.pt",
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Test Quadrotor PPO",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_ppo.py",
+            "args": [
+                "--cfg", "examples/cfg/ppo/quadrotor_gs_traj_global_8.yaml",
+                "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/ppo/gate_mid/12-30-2024-12-18-23_SOTA/best_policy.pt",
+                "--play",
+                "--render"
+            ],
+            "console": "integratedTerminal"
+        },
+
+        {
+            "name": "Train Quadrotor GS Traj Global BPTT",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_bptt.py",
+            "args": [
+                "--cfg", "examples/cfg/bptt/quadrotor_gs_traj_global_8.yaml",
+                "--logdir", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/bptt",
+                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/gate_mid/01-10-2025-10-26-34/best_policy.pt",
+                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/clutter/01-12-2025-12-35-52/best_policy.pt",
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Test Quadrotor GS Traj Global BPTT",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_bptt.py",
+            "args": [
+                "--cfg", "examples/cfg/bptt/quadrotor_gs_traj_global_8.yaml", 
+                
+                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/gate_mid/01-22-2025-01-26-37_20n/policy_iter400_reward4150.464.pt",
+                "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/bptt/gate_mid/03-01-2025-22-59-24_paper_video/quadrotor_gs_traj_global_8policy_iter80_reward1345.428.pt",
+                "--play",
+                "--render"
+            ],
+            "console": "integratedTerminal"
+        },
+
+    
+    ]
+}
