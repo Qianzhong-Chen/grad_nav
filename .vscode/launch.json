@@ -50,9 +50,7 @@
             "program": "${workspaceFolder}/examples/train_gradnav.py",
             "args": [
                 "--cfg", "examples/cfg/gradnav/drone_multi_gate.yaml", 
-                "--checkpoint", "examples/logs/DroneMultiGate/shac/gate_mid/03-05-2025-21-23-51/policy_iter1500_reward2831.889.pt",
-                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobalMultiGate/shac/gate_right/02-26-2025-10-57-40/final_policy.pt",
-                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobalMultiGate/shac/gate_left/03-03-2025-14-40-04/best_policy.pt",
+                "--checkpoint", "examples/logs/DroneMultiGate/gradnav/gate_mid/03-08-2025-16-22-34/best_policy.pt",
                 "--play",
                 "--render"
             ],

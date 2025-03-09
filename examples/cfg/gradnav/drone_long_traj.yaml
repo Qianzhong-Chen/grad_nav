@@ -2,7 +2,7 @@ params:
   diff_env:
     name: DroneLongTrajEnv
     stochastic_env: True
-    episode_length: 800
+    episode_length: 600
     MM_caching_frequency: 16
 
   network:
@@ -24,8 +24,8 @@ params:
   config:
     name: drone_long_traj
     map_name: gate_mid # [gate_mid, gate_right, gate_left]
-    actor_learning_rate: 2.5e-3 # adam
-    critic_learning_rate: 2.5e-3 # adam
+    actor_learning_rate: 1e-4 # adam
+    critic_learning_rate: 1e-4 # adam
     vae_learning_rate: 5e-4
     vel_net_learning_rate: 5e-4
     lr_schedule: cosine # ['constant', 'linear', 'cosine']

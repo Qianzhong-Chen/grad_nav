@@ -50,7 +50,7 @@ import torchvision.models as models
 SINGLE_VISUAL_INPUT_SIZE = 16
 HISTORY_BUFFER_NUM = 5
 LATENT_VECT_NUM = 24
-DEPTH_DATA = False
+DEPTH_DATA = True
 
 class VisualPerceptionNet(nn.Module):
     def __init__(self, input_channels=3):
@@ -803,6 +803,8 @@ class DroneLongTrajEnv(DFlexEnv):
         
         if DEPTH_DATA:
             # Concatenate RGB image and depth data along the channel dimension
+            # only use depth data
+            input_tensor = torch.zeros_like(input_tensor)
             combined_tensor = torch.cat([input_tensor, depth_tensor], dim=1)
             # Resize to match SqueezeNet input size
             resize = nn.AdaptiveAvgPool2d((224, 224))
