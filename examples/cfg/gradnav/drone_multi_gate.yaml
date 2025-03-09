@@ -44,13 +44,10 @@ params:
     truncate_grads: True
     num_actors: 128
     save_interval: 25
-    max_epochs: 1800 # total training iterations
+    max_epochs: 200 # total training iterations
 
     rew_norm: False
     rew_momentum: 0.9
-
-    multi_stage: False
-    stage_change_time: 150
 
     multi_gate: True
     gate_change_time: 100

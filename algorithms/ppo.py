@@ -163,8 +163,8 @@ class QuadrotorGSMaskPosTrajGlobalPPOEnv(DFlexEnv):
         self.target_xy = tu.to_torch(list(target_xy), 
             device=self.device, requires_grad=True).repeat((self.num_envs, 1)) # navigation target
         # self.target_list = self.target.clone()
-        self.gs_init_pos = torch.tensor([[-7.0, -0., -0.]] * self.num_envs, device=self.device) # (x,y,z); gs dimension for visual info
-        self.point_could_init_pos = torch.tensor([[-6.0, -0., -0.]] * self.num_envs, device=self.device) # (x,y,z); point cloud dimension for obstacle distance & traj plan
+        self.gs_origin_offset = torch.tensor([[-7.0, -0., -0.]] * self.num_envs, device=self.device) # (x,y,z); gs dimension for visual info
+        self.point_could_origin_offset = torch.tensor([[-6.0, -0., -0.]] * self.num_envs, device=self.device) # (x,y,z); point cloud dimension for obstacle distance & traj plan
 
         # setup point cloud
         point_cloud_dir = Path(
@@ -186,7 +186,7 @@ class QuadrotorGSMaskPosTrajGlobalPPOEnv(DFlexEnv):
             
             
             # plane the global ref trajectory
-            traj_wp = self.reward_wp + self.point_could_init_pos[0].repeat((self.reward_wp.shape[0],1))
+            traj_wp = self.reward_wp + self.point_could_origin_offset[0].repeat((self.reward_wp.shape[0],1))
             traj_start = torch.tensor([[-6.0, 0, 1.2]], device=self.device)
             traj_dest = torch.tensor([[7.0, -2.0, 1.2]], device=self.device)
             self.ref_traj = self.traj_planner.plan_trajectories(traj_start, traj_dest, [traj_wp])
@@ -201,7 +201,7 @@ class QuadrotorGSMaskPosTrajGlobalPPOEnv(DFlexEnv):
             
             
             # plane the global ref trajectory
-            traj_wp = self.reward_wp + self.point_could_init_pos[0].repeat((self.reward_wp.shape[0],1))
+            traj_wp = self.reward_wp + self.point_could_origin_offset[0].repeat((self.reward_wp.shape[0],1))
             traj_start = torch.tensor([[-6.0, 0, 1.2]], device=self.device)
             traj_dest = torch.tensor([[7.0, -2.0, 1.2]], device=self.device)
             self.ref_traj = self.traj_planner.plan_trajectories(traj_start, traj_dest, [traj_wp])
@@ -220,7 +220,7 @@ class QuadrotorGSMaskPosTrajGlobalPPOEnv(DFlexEnv):
             
             
             # plane the global ref trajectory
-            traj_wp = self.reward_wp + self.point_could_init_pos[0].repeat((self.reward_wp.shape[0],1))
+            traj_wp = self.reward_wp + self.point_could_origin_offset[0].repeat((self.reward_wp.shape[0],1))
             traj_start = torch.tensor([[-6.0, 0, 1.2]], device=self.device)
             traj_dest = torch.tensor([[7.0, -2.0, 1.2]], device=self.device)
             self.ref_traj = self.traj_planner.plan_trajectories(traj_start, traj_dest, [traj_wp])
@@ -233,7 +233,7 @@ class QuadrotorGSMaskPosTrajGlobalPPOEnv(DFlexEnv):
                               [9.4, 1.5, 1.2],
                               [12.0, -2.3, 1.2]], device=self.device)
             # plane the global ref trajectory
-            traj_wp = self.reward_wp + self.point_could_init_pos[0].repeat((self.reward_wp.shape[0],1))
+            traj_wp = self.reward_wp + self.point_could_origin_offset[0].repeat((self.reward_wp.shape[0],1))
             traj_start = torch.tensor([[-6.0, 1.0, 1.2]], device=self.device)
             traj_dest = torch.tensor([[6.0, -2.3, 1.2]], device=self.device)
             self.ref_traj = self.traj_planner.plan_trajectories(traj_start, traj_dest, [traj_wp])
@@ -241,7 +241,7 @@ class QuadrotorGSMaskPosTrajGlobalPPOEnv(DFlexEnv):
         
         
         
-        self.reward_wp_list = [self.reward_wp + self.point_could_init_pos[0].repeat((self.reward_wp.shape[0],1))] * self.num_envs
+        self.reward_wp_list = [self.reward_wp + self.point_could_origin_offset[0].repeat((self.reward_wp.shape[0],1))] * self.num_envs
         self.reward_wp_record = []
         for i in range(self.reward_wp.shape[0]):
             self.reward_wp_record.append(torch.zeros(self.num_envs, dtype=torch.bool, device=self.device))
@@ -930,7 +930,7 @@ class QuadrotorGSMaskPosTrajGlobalPPOEnv(DFlexEnv):
 
         return checkpoint
     
-    def process_nerf_data(self, depth_list, nerf_img):
+    def process_GS_data(self, depth_list, nerf_img):
         # min depth from nerf
         batch,H,W,ch = depth_list.shape
         depth_list_up = depth_list[:,0:int(H/2),:,:]
@@ -975,7 +975,7 @@ class QuadrotorGSMaskPosTrajGlobalPPOEnv(DFlexEnv):
 
         # Parallized implementation
         # gs_quat = torso_quat # (x, y, z, w)
-        gs_pos = torso_pos + self.gs_init_pos # (x, y, z)
+        gs_pos = torso_pos + self.gs_origin_offset # (x, y, z)
         gs_pos[:, 1] = -gs_pos[:, 1]
         gs_pos[:, 2] = -gs_pos[:, 2]
         gs_pose = torch.cat([gs_pos, torch.zeros([self.num_envs, 3], device = self.device), torso_quat], dim=-1)
@@ -987,7 +987,7 @@ class QuadrotorGSMaskPosTrajGlobalPPOEnv(DFlexEnv):
             if self.nerf_count % self.nerf_freq == 0: # infer nerf every nerf_freq steps
                 self.time_report.start_timer("3D GS inference")
                 depth_list, nerf_img = self.gs.render(gs_pose) # (batch_size,H,W,1/3)
-                self.process_nerf_data(depth_list, nerf_img)
+                self.process_GS_data(depth_list, nerf_img)
                 self.time_report.end_timer("3D GS inference")
             self.nerf_count += 1            
             
@@ -999,7 +999,7 @@ class QuadrotorGSMaskPosTrajGlobalPPOEnv(DFlexEnv):
             # Normal test mode
             # NeRF data
             depth_list, nerf_img = self.gs.render(gs_pose) # (batch_size,H,W,1/3)
-            self.process_nerf_data(depth_list, nerf_img)
+            self.process_GS_data(depth_list, nerf_img)
 
             # Visualization
             # rgb from nerf
@@ -1172,8 +1172,8 @@ class QuadrotorGSMaskPosTrajGlobalPPOEnv(DFlexEnv):
         # torso_rot = self.obs_buf[:, 3:7]
         torso_quat = self.obs_buf[:, 3:7] # (x,y,z,w)
         drone_rot = torso_quat # (x, y, z, w)
-        drone_pos = torso_pos + self.point_could_init_pos # in point cloud dimension
-        drone_target = self.target + self.point_could_init_pos
+        drone_pos = torso_pos + self.point_could_origin_offset # in point cloud dimension
+        drone_target = self.target + self.point_could_origin_offset
 
         # make yaw angle align with velocity
         target_dirs = tu.normalize(self.privilege_obs_buf[:, [3,5]])
@@ -1182,7 +1182,7 @@ class QuadrotorGSMaskPosTrajGlobalPPOEnv(DFlexEnv):
         yaw_alignment = (heading_vec * target_dirs).sum(dim = -1)
 
         # Compute ref_x for all environments
-        ref_x = self.privilege_obs_buf[:, 0] + self.point_could_init_pos[0, 0]  # Shape: [num_envs]
+        ref_x = self.privilege_obs_buf[:, 0] + self.point_could_origin_offset[0, 0]  # Shape: [num_envs]
         ref_traj_x = self.ref_traj[:, 0]  # Shape: [ref_traj_length]
         diff = ref_traj_x.unsqueeze(0) - ref_x.unsqueeze(1)  # Shape: [num_envs, ref_traj_length]
         mask = diff > 0.5  # Shape: [num_envs, ref_traj_length]
@@ -1190,13 +1190,13 @@ class QuadrotorGSMaskPosTrajGlobalPPOEnv(DFlexEnv):
         min_diffs, min_indices = torch.min(diff_masked, dim=1)  # Shapes: [num_envs], [num_envs]
         no_valid_indices = torch.isinf(min_diffs)  # Shape: [num_envs]
         target_list = torch.empty((self.num_envs, 3), device=self.device)
-        default_target = self.target[0] + self.point_could_init_pos[0]  # Shape: [3]
+        default_target = self.target[0] + self.point_could_origin_offset[0]  # Shape: [3]
         target_list[:] = default_target
         valid_indices = ~no_valid_indices
         selected_indices = min_indices[valid_indices]
         targets = self.ref_traj[selected_indices]  # Shape: [num_valid_envs, 3]
         target_list[valid_indices] = targets
-        target_list = target_list - self.point_could_init_pos
+        target_list = target_list - self.point_could_origin_offset
 
 
 
@@ -1319,8 +1319,8 @@ class QuadrotorGSMaskPosTrajGlobalPPOEnv(DFlexEnv):
         # torso_rot = self.obs_buf[:, 3:7]
         torso_quat = self.obs_buf[:, 3:7] # (x,y,z,w)
         drone_rot = torso_quat # (x, y, z, w)
-        drone_pos = torso_pos + self.point_could_init_pos # in point cloud dimension
-        drone_target = self.target + self.point_could_init_pos
+        drone_pos = torso_pos + self.point_could_origin_offset # in point cloud dimension
+        drone_target = self.target + self.point_could_origin_offset
 
         # make yaw angle align with velocity
         # target_dirs = tu.normalize(self.privilege_obs_buf[:, [3,5]])
@@ -1334,7 +1334,7 @@ class QuadrotorGSMaskPosTrajGlobalPPOEnv(DFlexEnv):
         yaw_alignment = (heading_vec * target_dirs).sum(dim=-1)
 
         # Compute ref_x for all environments
-        ref_x = self.privilege_obs_buf[:, 0] + self.point_could_init_pos[0, 0]  # Shape: [num_envs]
+        ref_x = self.privilege_obs_buf[:, 0] + self.point_could_origin_offset[0, 0]  # Shape: [num_envs]
         ref_traj_x = self.ref_traj[:, 0]  # Shape: [ref_traj_length]
         diff = ref_traj_x.unsqueeze(0) - ref_x.unsqueeze(1)  # Shape: [num_envs, ref_traj_length]
         mask = diff > 0.5  # Shape: [num_envs, ref_traj_length]
@@ -1342,13 +1342,13 @@ class QuadrotorGSMaskPosTrajGlobalPPOEnv(DFlexEnv):
         min_diffs, min_indices = torch.min(diff_masked, dim=1)  # Shapes: [num_envs], [num_envs]
         no_valid_indices = torch.isinf(min_diffs)  # Shape: [num_envs]
         target_list = torch.empty((self.num_envs, 3), device=self.device)
-        default_target = self.target[0] + self.point_could_init_pos[0]  # Shape: [3]
+        default_target = self.target[0] + self.point_could_origin_offset[0]  # Shape: [3]
         target_list[:] = default_target
         valid_indices = ~no_valid_indices
         selected_indices = min_indices[valid_indices]
         targets = self.ref_traj[selected_indices]  # Shape: [num_valid_envs, 3]
         target_list[valid_indices] = targets
-        target_list = target_list - self.point_could_init_pos
+        target_list = target_list - self.point_could_origin_offset
         obst_dist = self.point_cloud.compute_nearest_distances(drone_pos, drone_rot)
 
         desire_velo_norm = (target_list - self.privilege_obs_buf[:, 0:3]) / torch.clamp(torch.norm(target_list - self.privilege_obs_buf[:, 0:3], dim=1, keepdim=True), min=1e-6)

@@ -60,7 +60,7 @@ class BatchLowPassFilter:
             self.last_values = self.alpha * new_values + (1 - self.alpha) * self.last_values.clone().detach()
         return self.last_values
 
-class SHAC5:
+class GradNav:
     def __init__(self, cfg):
         env_fn = getattr(envs, cfg["params"]["diff_env"]["name"])
         self.map_name = cfg["params"]["config"].get("map_name", 'gate_mid')
@@ -128,7 +128,6 @@ class SHAC5:
             self.rew_mean = 0.0
             self.rew_var = 1.0
 
-        self.multi_stage = cfg['params']['config'].get('multi_stage', False)
         self.stage_change_time = cfg['params']['config'].get('stage_change_time', 300)
         self.change_gate_count = 0
         self.multi_gate = cfg['params']['config'].get('multi_gate', False)
@@ -218,8 +217,6 @@ class SHAC5:
             self.save('init_policy')
 
         # initialize optimizer
-        # self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), betas = cfg['params']['config']['betas'], lr = self.actor_lr)
-        # self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), betas = cfg['params']['config']['betas'], lr = self.critic_lr)
         self.actor_optimizer = torch.optim.AdamW(self.actor.parameters(), betas = cfg['params']['config']['betas'], lr = self.actor_lr, weight_decay=5e-3)
         self.critic_optimizer = torch.optim.AdamW(self.critic.parameters(), betas = cfg['params']['config']['betas'], lr = self.critic_lr, weight_decay=5e-3)
         self.vae_optimizer = torch.optim.AdamW(self.vae.parameters(), betas = cfg['params']['config']['betas'], lr = self.vae_lr, weight_decay=1e-2)
@@ -241,11 +238,6 @@ class SHAC5:
             ckpt_dir = os.path.dirname(ckpt_path)
             self.load(cfg['params']['general']['checkpoint'])
             print_info(f'actor critic networks recovered from {ckpt_path}')
-            # if os.path.exists(os.path.join(ckpt_dir, 'visual_net.pth')):
-            #     self.load_visual_net(os.path.join(ckpt_dir, 'visual_net.pth'))
-            #     self.load_vae(os.path.join(ckpt_dir, 'best_vae.pth'))
-            #     self.load_vel_net(os.path.join(ckpt_dir, 'best_vel_net.pth'))
-            #     print_info(f'viusal net loaded')
         
         # for kl divergence computing
         self.old_mus = torch.zeros((self.steps_num, self.num_envs, self.num_actions), dtype = torch.float32, device = self.device)
@@ -397,15 +389,7 @@ class SHAC5:
                 vel_net_output, _ = self.vel_net.forward(self.obs_hist_buf)
                 obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(torch.tanh(actions), vae_output, vel_net_output)
 
-            # # Origianl code
-            # actions = self.actor(obs, deterministic = deterministic)
-            # # # TODO: bad implementation
-            # # invalid_rows = torch.isnan(actions).any(dim=1) | torch.isinf(actions).any(dim=1)
-            # # actions[invalid_rows] = 0
-            # vae_output, _ = self.vae.forward(self.obs_hist_buf)
-            # vel_net_output, _ = self.vel_net.forward(self.obs_hist_buf)
-            # obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(torch.tanh(actions), vae_output, vel_net_output)
-
+           
             self.obs_hist_buf = history_obs
 
             # update VAE
@@ -575,9 +559,7 @@ class SHAC5:
         episode_length = torch.zeros(self.num_envs, dtype = int)
         episode_gamma = torch.ones(self.num_envs, dtype = torch.float32, device = self.device)
         episode_discounted_loss = torch.zeros(self.num_envs, dtype = torch.float32, device = self.device)
-        if self.multi_stage:
-            self.env.training_stage = 1
-
+       
         obs = self.env.reset()
 
         games_cnt = 0
@@ -800,29 +782,8 @@ class SHAC5:
 
         # main training process
         for epoch in range(self.max_epochs):
-            # curriculum setting
-            if self.curriculum:
-                if epoch == 150:
-                    info = self.env.change_curriculum(1)
-                    print(f'curriculum has been changing: {info}')
-                elif epoch == 300:
-                    info = self.env.change_curriculum(2)
-                    print(f'curriculum has been changing: {info}')
-                elif epoch == 450:
-                    info = self.env.change_curriculum(3)
-                    print(f'curriculum has been changing: {info}')
-                elif epoch == 600:
-                    info = self.env.change_curriculum(0)
-                    print(f'curriculum has been changing: {info}')
-
-            # multi-stage training (using GT_vel or VAE_vel)
-            if self.multi_stage:
-                if epoch == self.stage_change_time:
-                    self.env.training_stage = 1
-                    self.vel_net_optimizer = torch.optim.AdamW(self.vel_net.parameters(), betas = [0.7, 0.95], lr = self.vel_net_lr, weight_decay=1e-2)
-                    print_info(f'change to use vae velo, velo net lr reset to {self.vel_net_lr}')
-
-            # multi-stage training (using GT_vel or VAE_vel)
+            time_start_epoch = time.time()
+            # Multi gate training process
             if self.multi_gate:
                 if (epoch+1) % self.gate_change_time == 0:
                     self.change_gate_count += 1
@@ -833,14 +794,6 @@ class SHAC5:
                     self.actor_optimizer = torch.optim.AdamW(self.actor.parameters(), betas = [0.7, 0.95], lr = self.actor_lr, weight_decay=5e-3)
                     print_info(f'map has been changed to {next_map_name}, actor lr reset to {self.actor_lr}')
 
-
-            # obstacle avoidance curriculum for certain envs
-            # if self.env.agent_name == 'quadrotor_gs_mask_pos_traj':
-            #     if epoch > 0 and epoch % 100 == 0:
-            #         self.env.collision_penalty_coef -= 0.1
-            #         self.env.collision_penalty = self.env.collision_penalty_coef*self.env.survive_reward 
-            #         print_info("collision_penalty now {:.2f}".format(self.env.collision_penalty))
-            time_start_epoch = time.time()
 
             # learning rate schedule
             if self.lr_schedule == 'linear':
@@ -932,11 +885,6 @@ class SHAC5:
 
             # logging
             time_elapse = time.time() - self.start_time
-            # self.writer.add_scalar('lr/iter', lr, self.iter_count)
-            # self.writer.add_scalar('actor_loss/step', self.actor_loss, self.step_count)
-            # self.writer.add_scalar('actor_loss/iter', self.actor_loss, self.iter_count)
-            # self.writer.add_scalar('value_loss/step', self.value_loss, self.step_count)
-            # self.writer.add_scalar('value_loss/iter', self.value_loss, self.iter_count)
             if len(self.episode_loss_his) > 0:
                 mean_episode_length = self.episode_length_meter.get_mean()
                 mean_policy_loss = self.episode_loss_meter.get_mean()
@@ -945,24 +893,7 @@ class SHAC5:
                 if mean_policy_loss < self.best_policy_loss:
                     print_info("save best policy with loss {:.2f}".format(mean_policy_loss))
                     self.save()
-                    # self.save_visual_net()
-                    # self.save_vae()
-                    # self.save_vel_net()
                     self.best_policy_loss = mean_policy_loss
-
-                # self.writer.add_scalar('policy_loss/step', mean_policy_loss, self.step_count)
-                # self.writer.add_scalar('policy_loss/time', mean_policy_loss, time_elapse)
-                # self.writer.add_scalar('policy_loss/iter', mean_policy_loss, self.iter_count)
-                # self.writer.add_scalar('rewards/step', -mean_policy_loss, self.step_count)
-                # self.writer.add_scalar('rewards/time', -mean_policy_loss, time_elapse)
-                # self.writer.add_scalar('rewards/iter', -mean_policy_loss, self.iter_count)
-                # self.writer.add_scalar('policy_discounted_loss/step', mean_policy_discounted_loss, self.step_count)
-                # self.writer.add_scalar('policy_discounted_loss/iter', mean_policy_discounted_loss, self.iter_count)
-                # self.writer.add_scalar('best_policy_loss/step', self.best_policy_loss, self.step_count)
-                # self.writer.add_scalar('best_policy_loss/iter', self.best_policy_loss, self.iter_count)
-                # self.writer.add_scalar('episode_lengths/iter', mean_episode_length, self.iter_count)
-                # self.writer.add_scalar('episode_lengths/step', mean_episode_length, self.step_count)
-                # self.writer.add_scalar('episode_lengths/time', mean_episode_length, time_elapse)
             else:
                 mean_policy_loss = np.inf
                 mean_policy_discounted_loss = np.inf
@@ -975,8 +906,7 @@ class SHAC5:
         
             if self.save_interval > 0 and (self.iter_count % self.save_interval == 0):
                 self.save("policy_iter{}_reward{:.3f}".format(self.iter_count, -mean_policy_loss))
-                # self.save_vae("vae_iter{}_reward{:.3f}".format(self.iter_count, -mean_policy_loss))
-                # self.save_vel_net("vel_net_iter{}_reward{:.3f}".format(self.iter_count, -mean_policy_loss))
+                
 
             # update target critic
             with torch.no_grad():
@@ -992,7 +922,6 @@ class SHAC5:
                        "VAE_loss": self.vae_loss,
                        "VEL_NET_loss": self.vel_net_loss,
                        "recons_loss": self.mean_recons_loss,
-                    #    "velo_loss": self.mean_vel_loss,
                        "kld_loss": self.mean_kld_loss,
                        "episode_length": mean_episode_length,
                        "max_grad":self.max_grad,
@@ -1001,20 +930,14 @@ class SHAC5:
                        })
 
         self.time_report.end_timer("algorithm")
-
         self.time_report.report()
         self.env.time_report.report()
         
         self.save('final_policy')
-
-        # save reward/length history
         self.episode_loss_his = np.array(self.episode_loss_his)
         self.episode_discounted_loss_his = np.array(self.episode_discounted_loss_his)
         self.episode_length_his = np.array(self.episode_length_his)
-        # np.save(open(os.path.join(self.log_dir, 'episode_loss_his.npy'), 'wb'), self.episode_loss_his)
-        # np.save(open(os.path.join(self.log_dir, 'episode_discounted_loss_his.npy'), 'wb'), self.episode_discounted_loss_his)
-        # np.save(open(os.path.join(self.log_dir, 'episode_length_his.npy'), 'wb'), self.episode_length_his)
-
+        
         # evaluate the final policy's performance
         self.run(self.num_envs)
 
@@ -1040,7 +963,6 @@ class SHAC5:
     def save(self, filename = None):
         if filename is None:
             filename = 'best_policy'
-        # torch.save([self.actor, self.critic, self.target_critic, self.obs_rms, self.vae, self.ret_rms], os.path.join(self.log_dir, "{}.pt".format(filename)))
         torch.save([self.actor, self.critic, self.target_critic, self.obs_rms, self.vae, self.vel_net, self.env.visual_net], os.path.join(self.log_dir, "{}.pt".format(filename)))
     
     def load(self, path):
@@ -1055,19 +977,4 @@ class SHAC5:
         self.env.visual_net = checkpoint[6].to(self.device)
         print_info(f"all nets have been loaded")
 
-    def save_temporary(self, cfg, filename = None):
-        ckpt_path = cfg['params']['general']['checkpoint']
-        ckpt_dir = os.path.dirname(ckpt_path)
-        if filename is None:
-            filename = 'best_policy'
-        # torch.save([self.actor, self.critic, self.target_critic, self.obs_rms, self.vae, self.ret_rms], os.path.join(self.log_dir, "{}.pt".format(filename)))
-        torch.save([self.actor, self.critic, self.target_critic, self.obs_rms, self.vae, self.vel_net, self.env.visual_net], os.path.join(ckpt_dir, "{}.pt".format(filename)))
-    
-       
-
-        
-    
-        
-    # def close(self):
-    #     self.writer.close()
     

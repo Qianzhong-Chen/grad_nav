@@ -2,7 +2,7 @@ params:
   diff_env:
     name: DroneLongTrajEnv
     stochastic_env: True
-    episode_length: 600
+    episode_length: 800
     MM_caching_frequency: 16
 
   network:
@@ -23,7 +23,7 @@ params:
 
   config:
     name: drone_long_traj
-    map_name: gate_mid # [gate_mid, gate_right, gate_left, clutter]
+    map_name: gate_mid # [gate_mid, gate_right, gate_left]
     actor_learning_rate: 2.5e-3 # adam
     critic_learning_rate: 2.5e-3 # adam
     vae_learning_rate: 5e-4
@@ -49,9 +49,6 @@ params:
     rew_norm: False
     rew_momentum: 0.9
 
-    multi_stage: False
-    stage_change_time: 800
-
     vel_net_early_stop: True
     vel_net_stop_time: 200
 
@@ -62,7 +59,7 @@ params:
 
     domain_randomization: True
 
-    # LPF
+    # Low Pass Filter
     LPF_train: True
     LPF_val: 0.5
 

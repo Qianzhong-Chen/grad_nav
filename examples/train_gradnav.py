@@ -81,7 +81,7 @@ def get_args(): # TODO: delve into the arguments
     
     # parse arguments
     args = parse_arguments(
-        description="SHAC5",
+        description="GradNav",
         custom_parameters=custom_parameters)
     
     return args
@@ -108,7 +108,7 @@ if __name__ == '__main__':
     for key in vargs.keys():
         cfg_train["params"]["general"][key] = vargs[key]
 
-    traj_optimizer = gradnav.SHAC5(cfg_train)
+    traj_optimizer = gradnav.GradNav(cfg_train)
 
     if args.train:
         traj_optimizer.train()
