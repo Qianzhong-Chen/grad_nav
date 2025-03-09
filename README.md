@@ -63,6 +63,12 @@ git checkout <branch_name>
 ## Testing
 Same as above.
 
+## Usage guidance
+- Three parts are the most important: 
+  - configuration file: <examples/cfg/algo_name/env_name.yaml>, control the hyper-parameter for training as well as 3D GS map choice
+  - environment file: <envs/env_name.py>, control the agent-external_env interaction, including forward simulation, obs formation, reward caculation etc. Each env file is a different task.
+  - algorithm file: <algorithms/algo_name.py> based on the data from env file, train the neural networks.
+
 
 ## Citation
 

@@ -29,37 +29,6 @@
             "console": "integratedTerminal"
         },
 
-        {
-            "name": "Train GRaD-Nav paper test",
-            "type": "python",
-            "request": "launch",
-            "program": "${workspaceFolder}/examples/train_gradnav.py",
-            "args": [
-                "--cfg", "examples/cfg/gradnav/drone_paper_test.yaml",
-                "--logdir", "examples/logs/DronePaperTest/gradnav",
-                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/gate_mid/01-10-2025-10-26-34/best_policy.pt",
-                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/clutter/01-12-2025-12-35-52/best_policy.pt",
-            ],
-            "console": "integratedTerminal"
-        },
-        {
-            "name": "Test GRaD-Nav Global paper test",
-            "type": "python",
-            "request": "launch",
-            "program": "${workspaceFolder}/examples/train_gradnav.py",
-            "args": [
-                "--cfg", "examples/cfg/gradnav/DronePaperTest.yaml", 
-                
-                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobalPaperTest/shac/gate_mid/02-16-2025-00-32-32/best_policy.pt",
-                "--checkpoint", "examples/logs/DronePaperTest/shac/gate_right/02-19-2025-18-54-41/best_policy.pt",
-                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/clutter/01-12-2025-16-28-36/best_policy.pt",                
-                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/simple_hover/02-01-2025-16-46-09/final_policy.pt", 
-                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/gate_left/01-21-2025-02-57-44/policy_iter600_reward4358.036.pt",
-                "--play",
-                "--render"
-            ],
-            "console": "integratedTerminal"
-        },
 
         {
             "name": "Train GRaD-Nav multi gate",
