@@ -181,12 +181,13 @@ class DroneMultiGateEnv(DFlexEnv):
         self.gs_origin_offset = torch.tensor([[-6.0, -0., -0.05]] * self.num_envs, device=self.device) # (x,y,z); gs dimension for visual info
         self.point_could_origin_offset = torch.tensor([[-6.0, -0., -0.05]] * self.num_envs, device=self.device) # (x,y,z); point cloud dimension for obstacle distance & traj plan
         # Initialize the reference trajectory for each map
-        self.init_multi_map()
+        
         
         # setup point cloud
         script_dir = Path(__file__).parent
         point_cloud_dir = script_dir / "assets" / "point_cloud"
         ply_file = point_cloud_dir / f"{self.map_lib[self.map_name]}.ply"
+        self.init_multi_map(ply_file)
         self.point_cloud = ObstacleDistanceCalculator(ply_file=ply_file)
         self.reward_wp = self.reward_wp_table[self.map_name]
         self.ref_traj = self.ref_traj_table[self.map_name]
@@ -318,7 +319,7 @@ class DroneMultiGateEnv(DFlexEnv):
         self.img_record = []
         self.action_record = np.zeros([self.episode_length,4])
         
-    def init_multi_map(self, ):
+    def init_multi_map(self, ply_file):
         self.ref_traj_table = {}
         self.reward_wp_table = {}
 
@@ -351,7 +352,7 @@ class DroneMultiGateEnv(DFlexEnv):
             
                 
             # plane the global ref trajectory
-            traj_planner = TrajectoryPlanner(ply_file=os.path.join(point_cloud_dir,f'{self.map_lib[map_name]}.ply'), 
+            traj_planner = TrajectoryPlanner(ply_file=ply_file, 
                                             safety_distance=0.15, 
                                             batch_size=1, 
                                             wp_distance=2.0,
@@ -904,7 +905,6 @@ class DroneMultiGateEnv(DFlexEnv):
 
         # State related rewards
         lin_vel_reward = self.lin_strength * torch.sum(torch.square(self.obs_buf[:, 14:17]), dim=-1) 
-        velo_rate_penalty = torch.sum(torch.square(self.prev_lin_vel - self.obs_buf[:, 14:17]), dim=-1) * self.lin_vel_rate_penalty
         pose_penalty = torch.sum(torch.abs(self.obs_buf[:, 2:6] - self.start_rotation), dim=-1) * self.pose_penalty
         height_penalty = torch.square(self.obs_buf[:,0] - self.target_height) * self.height_penalty
         height_change_penalty = torch.square(self.obs_buf[:,1]) * self.height_change_penalty
@@ -965,7 +965,6 @@ class DroneMultiGateEnv(DFlexEnv):
                         obst_reward + 
                         pose_penalty +
                         lin_vel_reward + 
-                        velo_rate_penalty +
                         heading_reward + 
                         target_reward + 
                         action_penalty + 
