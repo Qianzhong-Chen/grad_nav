@@ -34,7 +34,7 @@ In this paper, we present a GPU-based differentiable simulation and propose a po
 
 1. **Download Required Data:**
    - [3DGS Data](https://drive.google.com/drive/folders/1nx2JLNtK6uSJuDX8HUS75eTrn6gfR0jG?usp=sharing)
-   - [Point Cloud Data](https://drive.google.com/drive/folders/1nx2JLNtK6uSJuDX8HUS75eTrn6gfR0jG?usp=sharing)
+   - [Point Cloud Data](https://drive.google.com/drive/folders/1ZdvTSQBcCL8WTKPaocCjHBj_vTPpjfjS?usp=sharing)
 
 2. **Place the downloaded folders in:**
   <GRaD_Nav_internal/envs/assets/>

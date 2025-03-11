@@ -50,7 +50,7 @@ import torchvision.models as models
 SINGLE_VISUAL_INPUT_SIZE = 16
 HISTORY_BUFFER_NUM = 5
 LATENT_VECT_NUM = 24
-DEPTH_DATA = True
+DEPTH_DATA = False
 
 class VisualPerceptionNet(nn.Module):
     def __init__(self, input_channels=3):
@@ -140,7 +140,7 @@ class DroneLongTrajEnv(DFlexEnv):
         self.mass_range = 0.2
         self.min_thrust = 24.0
         self.thrust_range = 4.0
-        self.obs_noise_level = 0.05
+        self.obs_noise_level = 0.1
         self.br_delay_factor = 0.8
         self.thrust_delay_factor = 0.7
         self.start_height = 1.25
@@ -280,7 +280,7 @@ class DroneLongTrajEnv(DFlexEnv):
         if self.map_name == 'gate_mid':
             self.up_strength = 0.25
             self.heading_strength = 0.75 # reward yaw motion align with lin_vel
-            self.lin_strength = -2.
+            self.lin_strength = -1.5
             self.lin_vel_rate_penalty = -0.75
             self.action_penalty = -1.0
             self.action_change_penalty = -1.0
@@ -803,8 +803,6 @@ class DroneLongTrajEnv(DFlexEnv):
         
         if DEPTH_DATA:
             # Concatenate RGB image and depth data along the channel dimension
-            # only use depth data
-            input_tensor = torch.zeros_like(input_tensor)
             combined_tensor = torch.cat([input_tensor, depth_tensor], dim=1)
             # Resize to match SqueezeNet input size
             resize = nn.AdaptiveAvgPool2d((224, 224))
