@@ -44,7 +44,7 @@ In this paper, we present a GPU-based differentiable simulation and propose a po
 3. **Update Configuration:**
 - Modify lines **4-14** in:
   ```
-  GRaD_Nav_internal/envs/assets/gs_data/map_name/splatfacto/time/config.yml
+  GRaD_Nav_internal/envs/assets/gs_data/<map_name>/splatfacto/<time>/config.yml
   ```
 - Set the corresponding paths to your **3DGS data folder** manually.
 
