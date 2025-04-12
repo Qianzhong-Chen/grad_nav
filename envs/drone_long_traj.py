@@ -727,8 +727,8 @@ class DroneLongTrajEnv(DFlexEnv):
 
 
             # clear VAE variables
-            self.latent_vect = torch.zeros([self.num_envs, LATENT_VECT_NUM], device=self.device, dtype = torch.float)
-            self.lin_vel_vae = torch.zeros([self.num_envs, 3], device=self.device, dtype = torch.float)
+            self.latent_vect[env_ids] = torch.zeros([len(env_ids), LATENT_VECT_NUM], device=self.device, dtype = torch.float)
+            self.lin_vel_vae[env_ids] = torch.zeros([len(env_ids), 3], device=self.device, dtype = torch.float)
 
             self.progress_buf[env_ids] = 0
             self.calculateObservations()
