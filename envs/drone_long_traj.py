@@ -104,24 +104,6 @@ class DroneLongTrajEnv(DFlexEnv):
 
         self.init_sim()
         self.episode_length = episode_length
-
-        # # Set
-        # if self.map_name == 'gate_mid':
-        #     target = (13.0, -2.0, 1.5) 
-        #     target_xy = (13.0, -2.0)
-        # elif self.map_name == 'gate_left':
-        #     target = (13.0, -2.0, 1.2) 
-        #     target_xy = (13.0, -2.0)
-        # elif self.map_name == 'gate_right':
-        #     target = (13.0, -2.0, 1.5) 
-        #     target_xy = (13.0, -2.0)
-        # else:
-        #     raise ValueError(f"Map {self.map_name} is not supported for navigation target setup.")
-        
-        # self.target = tu.to_torch(list(target), device=self.device, requires_grad=True).repeat((self.num_envs, 1)) # navigation target
-        # self.target_xy = tu.to_torch(list(target_xy), device=self.device, requires_grad=True).repeat((self.num_envs, 1)) # navigation target
-        
-        
         self.gs_origin_offset = torch.tensor([[-6.0, 0., 0.]] * self.num_envs, device=self.device) # (x,y,z); 3DGS origin on the room center, in training, we set the traj start as origin
         self.point_could_origin_offset = torch.tensor([[-6.0, 0., 0.]] * self.num_envs, device=self.device) # (x,y,z); point cloud origin on the room center, in training, we set the traj start as origin
 
@@ -144,7 +126,7 @@ class DroneLongTrajEnv(DFlexEnv):
                                         [7.6, 0.7, 1.3],
                                         [9.7, 1.5, 0.9],
                                         [11.8, 0, 1.5],
-                                        [13.0, -2., 1.5]
+                                        # [13.0, -2., 1.5]
                                         ], device=self.device) # (x,y,z)
             
             
@@ -159,12 +141,11 @@ class DroneLongTrajEnv(DFlexEnv):
 
         elif self.map_name == 'gate_right':
             self.reward_wp = torch.tensor([
-                                        [-3.0, -1.0, 1.3],
                                         [6.0, -1.2, 1.5],
                                         [7.8, 0.6, 1.1],
                                         [9.7, 1.4, 0.7],
                                         [11.8, 0, 1.3],
-                                        [13.0, -2., 1.5]
+                                        # [13.0, -2., 1.5]
                                         ], device=self.device) # (x,y,z)
 
 
@@ -701,45 +682,6 @@ class DroneLongTrajEnv(DFlexEnv):
         if self.visualize:
             self.record_visualization_data(gs_pose, torso_pos, ang_vel, lin_vel, rpy_data)
 
-            # img_transform = Resize((360, 640), antialias=True)
-            # depth_list, rgb_img = self.gs.render(gs_pose) # (batch_size,H,W,1/3)
-            # self.process_GS_data(depth_list, rgb_img)
-
-            # # Visualization
-            # # rgb from nerf
-            # rgb_img = torch.permute(rgb_img[0], (2,0,1))
-            # img = img_transform(rgb_img)
-
-            # pos_data = torso_pos.clone()
-            # pos_data = pos_data.detach().cpu().numpy()
-            # depth_data = self.depth_list.clone()
-            # depth_data = depth_data.detach().cpu().numpy()
-            # action_data = self.actions.clone().detach().cpu().numpy()
-            # ang_vel_data = ang_vel.clone().detach().cpu().numpy()
-            # # velo_data = lin_vel_new.clone().detach().cpu().numpy()
-            # velo_data = lin_vel.clone().detach().cpu().numpy()
-
-            # self.x_record.append(pos_data[0, 0])
-            # self.y_record.append(pos_data[0, 1])
-            # self.z_record.append(pos_data[0, 2])
-            # self.roll_record.append(rpy_data[0, 0])
-            # self.pitch_record.append(rpy_data[0, 1])
-            # self.yaw_record.append(rpy_data[0, 2])
-            # self.velo_x_record.append(velo_data[0, 0])
-            # self.velo_y_record.append(velo_data[0, 1])
-            # self.velo_z_record.append(velo_data[0, 2])
-            # self.ang_velo_x_record.append(ang_vel_data[0, 0])
-            # self.ang_velo_y_record.append(ang_vel_data[0, 1])
-            # self.ang_velo_z_record.append(ang_vel_data[0, 2])
-            # self.vae_velo_x_record.append(vae_velo_data[0, 0])
-            # self.vae_velo_y_record.append(vae_velo_data[0, 1])
-            # self.vae_velo_z_record.append(vae_velo_data[0, 2])
-            # self.depth_record.append(depth_data[0]/2)
-            # self.img_record.append(img)
-            # if self.episode_count < self.episode_length:
-            #     self.action_record[self.episode_count,:] = action_data
-            # self.episode_count += 1
-
         # Abalation variables        
         latent_abalation = torch.zeros_like(self.latent_vect)
 
@@ -811,7 +753,7 @@ class DroneLongTrajEnv(DFlexEnv):
        
         # use quat directly
         target_dirs = tu.normalize(self.privilege_obs_buf[:, 3:5])
-        heading_vec = quaternion_yaw_forward(torso_quat)  # Extract (x, y) forward direction, input is (x, y, z, w)
+        heading_vec = quaternion_yaw_forward(torso_quat)  
         yaw_alignment = (heading_vec * target_dirs).sum(dim=-1) 
 
 
@@ -1035,14 +977,6 @@ class DroneLongTrajEnv(DFlexEnv):
         plt.legend(['vx', 'vy', 'vz', 'vae_vx', 'vae_vy', 'vae_vz'])
         plt.savefig(f'{save_path}/velo_plot.png')
 
-
-        # figure depth 
-        plt.figure()
-        plt.plot(range(len(self.depth_record)), self.depth_record)
-        plt.xlabel("Step")
-        plt.ylabel("depth/m")
-        plt.savefig(f'{save_path}/depth_plot.png')
-
         # figure action
         plt.figure()
         for action_id in range(3):
@@ -1055,7 +989,6 @@ class DroneLongTrajEnv(DFlexEnv):
         plt.legend(['r_des', 'p_des', 'y_des', 'r', 'p', 'y'])
         plt.savefig(f'{save_path}/body_rate_plot.png')
         np.savetxt(f'{save_path}/action.txt', self.action_record, delimiter=',')
-
 
         plt.figure()
         plt.plot(range(np.shape(self.action_record)[0]), self.action_record[:,3]) 

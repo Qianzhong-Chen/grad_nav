@@ -50,7 +50,7 @@ params:
     truncate_grads: True
     num_actors: 128
     save_interval: 50
-    max_epochs: 800 # total training iterations
+    max_epochs: 600 # total training iterations
     domain_randomization: True
 
     # Low Pass Filter

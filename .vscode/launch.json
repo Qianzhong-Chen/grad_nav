@@ -22,7 +22,7 @@
             "program": "${workspaceFolder}/examples/train_gradnav.py",
             "args": [
                 "--cfg", "examples/cfg/gradnav/drone_long_traj.yaml",
-                "--checkpoint", "examples/logs/DroneLongTraj/gradnav/gate_mid/03-08-2025-18-39-36/best_policy.pt",
+                "--checkpoint", "examples/logs/DroneLongTraj/gradnav/gate_right/06-12-2025-01-08-58/best_policy.pt",
                 "--play",
                 "--render"
             ],
