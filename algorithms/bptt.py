@@ -19,11 +19,8 @@ import torch
 from torchvision import models, transforms
 import torch.nn as nn
 import math
-
-from tensorboardX import SummaryWriter
 import yaml
 
-import dflex as df
 
 import envs
 import models.actor
@@ -33,7 +30,7 @@ import utils.torch_utils as tu
 from utils.time_report import TimeReport
 from utils.average_meter import AverageMeter
 from utils.running_mean_std import RunningMeanStd
-from .vae_3 import VAE
+from ..models.vae import VAE
 from .velo_net import VELO_NET
 
 import pdb
@@ -172,7 +169,6 @@ class BPTT:
                     del save_cfg['params']['general'][key]
 
             yaml.dump(save_cfg, open(os.path.join(self.log_dir, 'cfg.yaml'), 'w'))
-            self.writer = SummaryWriter(os.path.join(self.log_dir, 'log'))
             # save interval
             self.save_interval = cfg["params"]["config"].get("save_interval", 500)
             # stochastic inference
@@ -735,9 +731,6 @@ class BPTT:
 
             # logging
             time_elapse = time.time() - self.start_time
-            # self.writer.add_scalar('lr/iter', lr, self.iter_count)
-            # self.writer.add_scalar('actor_loss/step', self.actor_loss, self.step_count)
-            # self.writer.add_scalar('actor_loss/iter', self.actor_loss, self.iter_count)
             if len(self.episode_loss_his) > 0:
                 mean_episode_length = self.episode_length_meter.get_mean()
                 mean_policy_loss = self.episode_loss_meter.get_mean()
@@ -748,20 +741,6 @@ class BPTT:
                     self.save()
                     self.best_policy_loss = mean_policy_loss
 
-                # # self.save("latest_policy")
-                # self.writer.add_scalar('policy_loss/step', mean_policy_loss, self.step_count)
-                # self.writer.add_scalar('policy_loss/time', mean_policy_loss, time_elapse)
-                # self.writer.add_scalar('policy_loss/iter', mean_policy_loss, self.iter_count)
-                # self.writer.add_scalar('rewards/step', -mean_policy_loss, self.step_count)
-                # self.writer.add_scalar('rewards/time', -mean_policy_loss, time_elapse)
-                # self.writer.add_scalar('rewards/iter', -mean_policy_loss, self.iter_count)
-                # self.writer.add_scalar('policy_discounted_loss/step', mean_policy_discounted_loss, self.step_count)
-                # self.writer.add_scalar('policy_discounted_loss/iter', mean_policy_discounted_loss, self.iter_count)
-                # self.writer.add_scalar('best_policy_loss/step', self.best_policy_loss, self.step_count)
-                # self.writer.add_scalar('best_policy_loss/iter', self.best_policy_loss, self.iter_count)
-                # self.writer.add_scalar('episode_lengths/iter', mean_episode_length, self.iter_count)
-                # self.writer.add_scalar('episode_lengths/step', mean_episode_length, self.step_count)
-                # self.writer.add_scalar('episode_lengths/time', mean_episode_length, time_elapse)
             else:
                 mean_policy_loss = np.inf
                 mean_policy_discounted_loss = np.inf
@@ -770,7 +749,6 @@ class BPTT:
             print('iter {}: ep loss {:.2f}, ep discounted loss {:.2f}, ep len {:.1f}, fps total {:.2f}, grad norm before clip {:.2f}, grad norm after clip {:.2f}'.format(\
                     self.iter_count, mean_policy_loss, mean_policy_discounted_loss, mean_episode_length, self.steps_num * self.num_envs / (time_end_epoch - time_start_epoch), self.grad_norm_before_clip, self.grad_norm_after_clip))
 
-            # self.writer.flush()
         
             if self.save_interval > 0 and (self.iter_count % self.save_interval == 0):
                 self.save(self.name + "policy_iter{}_reward{:.3f}".format(self.iter_count, -mean_policy_loss))
@@ -780,7 +758,6 @@ class BPTT:
                        "VAE_loss": self.vae_loss,
                        "VEL_NET_loss": self.vel_net_loss,
                        "recons_loss": self.mean_recons_loss,
-                    #    "velo_loss": self.mean_vel_loss,
                        "kld_loss": self.mean_kld_loss,
                        "episode_length": mean_episode_length,
                        "max_grad":self.max_grad,
@@ -829,6 +806,4 @@ class BPTT:
         self.env.visual_net = checkpoint[4].to(self.device)
         print_info(f"all nets have been loaded")
         
-    # def close(self):
-    #     self.writer.close()
     

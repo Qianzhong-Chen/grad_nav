@@ -2,8 +2,6 @@ import numpy as np
 import open3d as o3d
 import heapq
 from scipy.ndimage import binary_dilation
-from concurrent.futures import ProcessPoolExecutor, TimeoutError
-import multiprocessing
 import torch
 import time
 
@@ -17,8 +15,8 @@ class TrajectoryPlanner:
         self.points = self.load_point_cloud()
         self.occupancy_grid, self.min_bound = self.create_occupancy_grid()
         self.trajectory_batches = []
-        self.waypoints_list = None  # To store per-trajectory waypoints for visualization
-        self.destination_positions = None  # To store destinations for visualization
+        self.waypoints_list = None  
+        self.destination_positions = None  
         self.wp_distance = wp_distance
         
 
@@ -116,55 +114,43 @@ class TrajectoryPlanner:
         resampled_trajectory = []
 
         waypoint_indices = []
-        # Find indices of waypoints in the trajectory
         for wp in waypoints:
             distances = np.linalg.norm(trajectory_points - wp, axis=1)
             idx = np.argmin(distances)
             waypoint_indices.append(idx)
 
-        # Sort waypoints indices to ensure order
         waypoint_indices = sorted(set(waypoint_indices))
-
-        # Resample between waypoints
         for i in range(len(waypoint_indices) - 1):
             start_idx = waypoint_indices[i]
             end_idx = waypoint_indices[i + 1]
 
             segment = trajectory_points[start_idx:end_idx + 1]
 
-            # Compute cumulative distances along the segment
             segment_lengths = np.linalg.norm(np.diff(segment, axis=0), axis=1)
             cumulative_lengths = np.insert(np.cumsum(segment_lengths), 0, 0)
             total_length = cumulative_lengths[-1]
             num_samples = max(int(np.ceil(total_length / step_size)), 1) + 1
             sample_distances = np.linspace(0, total_length, num_samples)
-
-            # Interpolate the segment at the sample distances
             resampled_segment = np.zeros((num_samples, 3))
             for j in range(3):
                 resampled_segment[:, j] = np.interp(
                     sample_distances, cumulative_lengths, segment[:, j]
                 )
 
-            # Remove the last point to avoid duplicates except for the final segment
             if i < len(waypoint_indices) - 2:
                 resampled_segment = resampled_segment[:-1]
 
             resampled_trajectory.append(resampled_segment)
 
-        # Concatenate all resampled segments
         resampled_trajectory = np.vstack(resampled_trajectory)
         return resampled_trajectory
 
     def ensure_increasing_x_with_waypoints(self, trajectory_points, waypoints):
-        # Ensure that x is only increasing
         x = trajectory_points[:, 0]
         dx = np.diff(x)
-        # Identify indices where x is not decreasing
-        valid_indices = np.where(dx >= 0)[0] + 1  # +1 to correct index shift
-        valid_indices = np.insert(valid_indices, 0, 0)  # Include the first point
+        valid_indices = np.where(dx >= 0)[0] + 1 
+        valid_indices = np.insert(valid_indices, 0, 0) 
 
-        # Ensure waypoints are included
         waypoint_indices = []
         for wp in waypoints:
             distances = np.linalg.norm(trajectory_points - wp, axis=1)
@@ -172,10 +158,7 @@ class TrajectoryPlanner:
             waypoint_indices.append(idx)
         waypoint_indices = set(waypoint_indices)
 
-        # Combine valid indices and waypoint indices
         combined_indices = sorted(set(valid_indices) | waypoint_indices)
-
-        # Filter the trajectory
         filtered_trajectory = trajectory_points[combined_indices]
         return filtered_trajectory
 
@@ -202,19 +185,13 @@ class TrajectoryPlanner:
         if self.verbose:
             print(f"Trajectory {idx+1} planning completed.")
         
-        # Convert the full path to a NumPy array
         trajectory_points = np.array(full_path)
-        
-        # Resample the trajectory between waypoints to ensure waypoints are included
         resampled_trajectory = self.resample_trajectory_with_waypoints(full_path, waypoints, step_size=self.wp_distance)
-
-        # Ensure that x is only increasing, but preserve waypoints
         resampled_trajectory = self.ensure_increasing_x_with_waypoints(resampled_trajectory, waypoints)
         
         return resampled_trajectory.tolist()
 
     def plan_trajectories(self, current_positions, destination_positions, waypoints_list):
-        # Handle data type conversion inside the method
         if isinstance(current_positions, torch.Tensor):
             current_positions = current_positions.clone().detach().cpu().numpy()
         if isinstance(destination_positions, torch.Tensor):
@@ -228,15 +205,11 @@ class TrajectoryPlanner:
             self.waypoints_list = converted_waypoints_list  # Store for visualization
         else:
             raise ValueError("waypoints_list must be a list of torch.tensor or numpy arrays.")
-
-        # Ensure current_positions and destination_positions are NumPy arrays
         current_positions = np.asarray(current_positions)
         destination_positions = np.asarray(destination_positions)
 
         if not (len(current_positions) == len(destination_positions) == len(self.waypoints_list) == self.batch_size):
             raise ValueError("Input lists must have the same length as batch_size.")
-
-        # Prepare arguments for each trajectory
         args_list = []
         for i in range(self.batch_size):
             current_pos = current_positions[i]
@@ -248,13 +221,10 @@ class TrajectoryPlanner:
             destination_pos = np.asarray(destination_pos, dtype=np.float64)
 
             args_list.append((i, current_pos, destination_pos, waypoints))
-
-        # Store destination_positions for visualization
+        
         self.destination_positions = destination_positions
+        self.trajectory_batches = [None] * self.batch_size  
 
-        self.trajectory_batches = [None] * self.batch_size  # Initialize with None
-
-        # sequential implementation
         for i in range(self.batch_size):
             current_pos = current_positions[i]
             destination_pos = destination_positions[i]
@@ -265,26 +235,6 @@ class TrajectoryPlanner:
                 self.trajectory_batches[i] = result
             except Exception as e:
                 print(f'trajectory for env {i} planning failed for {e}')
-
-        # # multi process implementation
-        # with ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
-        #     futures = []
-        #     for args in args_list:
-        #         future = executor.submit(self.plan_single_trajectory, args)
-        #         futures.append((args[0], future))  # args[0] is the index
-
-        #     for idx, future in futures:
-        #         try:
-        #             result = future.result(timeout=5)  # Wait up to 5 seconds
-        #             self.trajectory_batches[idx] = result
-        #         except TimeoutError:
-        #             if self.verbose:
-        #                 print(f"Trajectory {idx+1} planning timed out after 5 seconds.")
-        #             self.trajectory_batches[idx] = None
-        #         except Exception as e:
-        #             if self.verbose:
-        #                 print(f"Trajectory {idx+1} planning failed with exception: {e}")
-        #             self.trajectory_batches[idx] = None
 
         return self.trajectory_batches
     
@@ -306,38 +256,26 @@ class TrajectoryPlanner:
                 length = np.linalg.norm(direction)
                 if length == 0:
                     continue
-                direction /= length  # Normalize direction
+                direction /= length  
 
-                # Create cylinder
                 cylinder = o3d.geometry.TriangleMesh.create_cylinder(radius=radius, height=length)
-
-                # Calculate rotation to align with direction
-                z_axis = np.array([0, 0, 1])  # Default cylinder orientation
+                z_axis = np.array([0, 0, 1])  
                 rotation_axis = np.cross(z_axis, direction)
                 rotation_angle = np.arccos(np.dot(z_axis, direction))
                 if np.linalg.norm(rotation_axis) > 1e-6:
-                    rotation_axis /= np.linalg.norm(rotation_axis)  # Normalize rotation axis
+                    rotation_axis /= np.linalg.norm(rotation_axis)  
                     cylinder.rotate(o3d.geometry.get_rotation_matrix_from_axis_angle(rotation_axis * rotation_angle), center=(0, 0, 0))
 
-                # Translate cylinder to the middle point between start and end
                 cylinder.translate((start + end) / 2)
-
-                # Color the cylinder
                 cylinder.paint_uniform_color(color)
 
                 tube_mesh += cylinder
             return tube_mesh
 
-        
-        # Create geometries list
         geometries = []
-
-        # Add PointCloud (obstacles)
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(self.points)
         geometries.append(pcd)
-
-        # Define colors for trajectories
         colors = [
             [1, 0, 0],  # Red
             [0, 1, 0],  # Green
@@ -397,7 +335,6 @@ if __name__ == "__main__":
     ply_file = "/home/david/DiffRL_NeRF/envs/assets/point_cloud/sv_1007_gate_mid.ply"
     batch_size = 1
     current_positions_torch = torch.tensor([[-6.0, 0, 1.2]], device='cuda:0').repeat(batch_size,1)
-
     destination_positions_torch = torch.tensor([[7.0, -2., 1.3]], device='cuda:0').repeat(batch_size,1)
     waypoints_torch = [
                 torch.tensor([
@@ -410,22 +347,22 @@ if __name__ == "__main__":
                 
                 ]*batch_size
     
-    # # gate_left
-    # ply_file = "/home/david/DiffRL_NeRF/envs/assets/point_cloud/sv_917_3_left_nerfstudio.ply"
-    # batch_size = 1
-    # current_positions_torch = torch.tensor([[-6.0, 0, 1.2]], device='cuda:0').repeat(batch_size,1)
+    # gate_left
+    ply_file = "/home/david/DiffRL_NeRF/envs/assets/point_cloud/sv_917_3_left_nerfstudio.ply"
+    batch_size = 1
+    current_positions_torch = torch.tensor([[-6.0, 0, 1.2]], device='cuda:0').repeat(batch_size,1)
 
-    # destination_positions_torch = torch.tensor([[7.0, -2., 1.2]], device='cuda:0').repeat(batch_size,1)
+    destination_positions_torch = torch.tensor([[7.0, -2., 1.2]], device='cuda:0').repeat(batch_size,1)
    
-    # waypoints_torch = [
-    #             torch.tensor([
-    #                           [-0.2, 1.2, 1.4],
-    #                           [3.7, 1.2, 0.6],
-    #                           [5.8, 0, 1.2],
-    #                           [7.0, -2., 1.2]
-    #                           ], device='cuda:0'),
+    waypoints_torch = [
+                torch.tensor([
+                              [-0.2, 1.2, 1.4],
+                              [3.7, 1.2, 0.6],
+                              [5.8, 0, 1.2],
+                              [7.0, -2., 1.2]
+                              ], device='cuda:0'),
                 
-    #             ]*batch_size
+                ]*batch_size
 
     # gate_right
     ply_file = "/home/david/DiffRL_NeRF/envs/assets/point_cloud/sv_917_3_right_nerfstudio.ply"
@@ -446,93 +383,7 @@ if __name__ == "__main__":
                 
                 ]*batch_size
 
-    # # simple_hover
-    # ply_file = "/home/david/DiffRL_NeRF/envs/assets/point_cloud/sv_917_3_right_nerfstudio.ply"
-    # batch_size = 1
-    # current_positions_torch = torch.tensor([[-6.0, 0, 1.2]], device='cuda:0').repeat(batch_size,1)
-
-    # destination_positions_torch = torch.tensor([[-6.0, -0., 1.2]], device='cuda:0').repeat(batch_size,1)
-   
-    # waypoints_torch = [
-    #             torch.tensor([
-    #                           [-6.0, 0, 1.2]
-    #                           ], device='cuda:0'),
-                
-    #             ]*batch_size
-
-    # # for room calibration
-    # waypoints_torch = [
-    #             torch.tensor([[-8.0, 0.0, 1.2],
-    #                           [-0.4, -1., 1.4],
-    #                           [3.2, 1.2, 0.6],
-    #                           [4.1, -1.2, 2.2],
-    #                           [7.0, -2., 1.2]
-    #                           ], device='cuda:0'),
-                
-    #             ]*batch_size
-
-    # # clutter
-    # ply_file = "/home/david/DiffRL_NeRF/envs/assets/point_cloud/sv_712_nerfstudio.ply"
-    # batch_size = 1
-    # current_positions_torch = torch.tensor([[-6.0, 1.0, 1.2]], device='cuda:0').repeat(batch_size,1)
-
-    # destination_positions_torch = torch.tensor([[6.0, -2.3, 1.2]], device='cuda:0').repeat(batch_size,1)
-    # waypoints_torch = [
-    #             torch.tensor([
-    #                           [-4.9, -0.6, 1.4],
-    #                           [0.1, -1.7, 0.6],
-    #                           [3.4, 1.5, 1.2],
-    #                           [6.0, -2.3, 1.2]], device='cuda:0'),
-                
-    #             ]*batch_size
-
-    ## Generalizable gate
-    # # gate_mid
-    # ply_file = "/home/david/DiffRL_NeRF/envs/assets/point_cloud/sv_1007_gate_mid.ply"
-    # batch_size = 1
-    # current_positions_torch = torch.tensor([[-6.0, 0, 1.35]], device='cuda:0').repeat(batch_size,1)
-    # destination_positions_torch = torch.tensor([[1.0, 0.0, 1.35]], device='cuda:0').repeat(batch_size,1)
-    # waypoints_torch = [
-    #             torch.tensor([
-    #                           [-2.0, 0.0, 1.3],
-    #                           [-0.2, -0.1, 1.4],
-                              
-    #                           ], device='cuda:0'),
-                
-    #             ]*batch_size
     
-    # # gate_left
-    ply_file = "/home/david/DiffRL_NeRF/envs/assets/point_cloud/sv_917_3_left_nerfstudio.ply"
-    batch_size = 1
-    current_positions_torch = torch.tensor([[-6.0, 0, 1.3]], device='cuda:0').repeat(batch_size,1)
-
-    destination_positions_torch = torch.tensor([[2.0, 1.0, 1.3]], device='cuda:0').repeat(batch_size,1)
-   
-    waypoints_torch = [
-                torch.tensor([
-                              [-2.0, 0.8, 1.3],
-                              [0.1, 1.0, 1.4],
-                             
-                              ], device='cuda:0'),
-                
-                ]*batch_size
-    
-
-    # # # gate_right
-    # ply_file = "/home/david/DiffRL_NeRF/envs/assets/point_cloud/sv_917_3_right_nerfstudio.ply"
-    # batch_size = 1
-    # current_positions_torch = torch.tensor([[-6.0, 0, 1.3]], device='cuda:0').repeat(batch_size,1)
-
-    # destination_positions_torch = torch.tensor([[2.0, -1.0, 1.3]], device='cuda:0').repeat(batch_size,1)
-   
-    # waypoints_torch = [
-    #             torch.tensor([
-    #                           [-2.0, -1.3, 1.3],
-    #                           [0.1, -1.2, 1.4],
-    #                           ], device='cuda:0'),
-                
-    #             ]*batch_size
-
 
     planner = TrajectoryPlanner(ply_file, batch_size=batch_size, safety_distance=0.15, wp_distance=2.0, verbose=False)
     start_t = time.time()

@@ -4,6 +4,7 @@ import os
 from re import T
 import torch
 import numpy as np
+import yaml
 from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.utils.eval_utils import eval_setup
 from scipy.spatial.transform import Rotation as R
@@ -37,12 +38,7 @@ class GS():
         self.channels = 3
         self.camera_out,self.width,self.height = self.generate_output_camera(width,height)
         self.camera_out.rescale_output_resolution(res)
-        # self.dataparser_T = (
-        #     self.pipeline.datamanager.train_dataparser_outputs.dataparser_transform
-        # )
-        # self.dataparser_scale = (
-        #     self.pipeline.datamanager.train_dataparser_outputs.dataparser_scale
-        # )
+       
     def generate_output_camera(self,width:int,height:int):
         fx,fy = 462.956,463.002
         cx,cy = 323.076,181.184
@@ -55,7 +51,6 @@ class GS():
             height=height,
             camera_type=CameraType.PERSPECTIVE,
         )
-
         camera_out = camera_out.to(self.device)
 
         return camera_out,width,height
@@ -110,7 +105,6 @@ class GS():
         Returns:
             tuple: A tuple (depth_batch, img_batch) where each is a tensor of shape (n, H, W, channels).
         """
-        # start_t = time.time()
         # Get batch size and set device
         batch_size = xcr_list.size(0)
         device = xcr_list.device
@@ -123,57 +117,52 @@ class GS():
         T_c2n_batch = pose2nerf_transform(positions, quaternions, device)  # Shape: (n, 4, 4)
         P_c2n_batch = T_c2n_batch[:, :3, :].float()  # Shape: (n, 3, 4)
 
-        
         # Pre-allocate tensors for batched depth and img outputs
         depth_batch = []
         img_batch = []
 
         for i in range(batch_size):
-            
-            
-            # Set camera transformation for each batch
             self.camera_out.camera_to_worlds = P_c2n_batch[i][None, :3, ...]
-            
             # Render outputs
             outputs = self.pipeline.model.get_outputs_for_camera(self.camera_out, obb_box=None)
             img_batch.append(outputs["rgb"])
             depth_batch.append(outputs["depth"])
 
-        # Log render time for whole batch
-        # elapsed_t = time.time() - start_t
-        # print(f'{elapsed_t} s')
         return torch.stack(depth_batch,dim=0), torch.stack(img_batch,dim=0)
 
-   
-    
-def get_gs(map:str, gs_path, resolution) -> GS:
-    # Generate some useful paths
+
+def get_gs(map: str, gs_path, resolution) -> 'GS':
     workspace_path = os.path.dirname(os.path.dirname(__file__))
-    main_dir_path = os.getcwd()
-    gs_path = os.path.join(workspace_path,f"envs/assets/gs_data")
+    gs_data_root = os.path.join(workspace_path, "envs/assets/gs_data")
     maps = {
-        "gate_left":"sv_917_3_left_nerfstudio",
-        "gate_right":"sv_917_3_right_nerfstudio",
-        "simple_hover":"sv_917_3_right_nerfstudio",
-        "gate_mid":"sv_1007_gate_mid",
-        "clutter":"sv_712_nerfstudio",
-        "backroom":"sv_1018_2",
-        "flightroom":"sv_1018_3",
+        "gate_left": "sv_917_3_left_nerfstudio",
+        "gate_right": "sv_917_3_right_nerfstudio",
+        "gate_mid": "sv_1007_gate_mid",
     }
 
-    map_folder = os.path.join(gs_path,maps[map])
-    print(map_folder)
+    map_folder = os.path.join(gs_data_root, maps[map])
     for root, _, files in os.walk(map_folder):
         if 'config.yml' in files:
             nerf_cfg_path = os.path.join(root, 'config.yml')
-
-    # Go into NeRF data folder and get NeRF object (because the NeRF instantation
-    # requires the current working directory to be the NeRF data folder)
-    os.chdir(gs_path)
-    gs = GS(Path(nerf_cfg_path), res = resolution)
+            break
+    else:
+        raise FileNotFoundError("config.yml not found in {}".format(map_folder))
+    with open(nerf_cfg_path, "r") as f:
+        content = f.read()
+    content = content.replace("${GS_DATA_DIR}", gs_data_root)
+    if "${" in content:
+        raise ValueError("Unresolved environment variable found in config: {}".format(nerf_cfg_path))
+    tmp_cfg_path = os.path.join(workspace_path, "temp_config_resolved.yaml")
+    with open(tmp_cfg_path, "w") as f:
+        f.write(content)
+    main_dir_path = os.getcwd()
+    os.chdir(gs_data_root)
+    gs = GS(Path(tmp_cfg_path), res=resolution)
     os.chdir(main_dir_path)
+    os.remove(tmp_cfg_path)
 
     return gs
+
 
 def quaternion_to_rotation_matrix(quaternions: torch.Tensor) -> torch.Tensor:
     """
@@ -247,12 +236,6 @@ def pose2nerf_transform(positions: torch.Tensor, quaternions: torch.Tensor, devi
 
     
     rotation_matrices = quaternion_to_rotation_matrix(quaternions)
-    # # Convert quaternions to rotation matrices in batch
-    # rotation_matrices = torch.tensor(
-    #     [R.from_quat(quaternion.cpu().numpy()).as_matrix() for quaternion in quaternions], 
-    #     device=device
-    # )  # Shape: (n, 3, 3)
-    
     T_d2f = torch.eye(4, device=device).expand(batch_size, -1, -1).clone()  # Initialize T_d2f
     T_d2f[:, :3, :3] = rotation_matrices  # Apply rotation
     T_d2f[:, :3, 3] = positions  # Apply translation
@@ -263,15 +246,3 @@ def pose2nerf_transform(positions: torch.Tensor, quaternions: torch.Tensor, devi
     return T_c2n_batch
 
 
-if __name__ == '__main__':
-    gs_dir = Path("/home/david/DiffRL_NeRF/envs/assets/gs_data")
-    map_name = 'gate_mid'
-    resolution_quality = 0.4
-
-    gs = get_gs(map_name, gs_dir, resolution_quality)
-    # depth_list, nerf_img = gs.render(gs_pose)
-
-    # Render the scene with trajectory
-    gs_pose = torch.tensor([[-6.0000, -0.0000, -1.3000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
-          0.0000,  1.0000]], device=gs.device)
-    gs.render(gs_pose)

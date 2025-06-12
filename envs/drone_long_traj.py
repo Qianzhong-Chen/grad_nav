@@ -21,74 +21,21 @@ from pathlib import Path
 from rich.console import Console
 from PIL import Image
 from envs.assets.quadrotor_dynamics_advanced import QuadrotorSimulator
-# from envs.assets.visiual_buffer import VisualBuffer
-
 import numpy as np
 np.set_printoptions(precision=5, linewidth=256, suppress=True)
 
-# try:
-#     from pxr import Usd
-# except ModuleNotFoundError:
-#     print("No pxr package")
-
-# from utils import load_utils as lu
 from utils import torch_utils as tu
 from utils.common import *
 from utils.gs_local import GS, get_gs
-from utils.rotation import dynamic_to_nerf_quaternion_batch, pose_transfer_ns, pose_transfer_ns_batched, quaternion_to_euler, quaternion_yaw_forward
-from utils.model_util import quat_from_axis_angle, transform, quat_from_axis_angle_batch
+from utils.rotation import quaternion_to_euler, quaternion_yaw_forward
 from utils.model import ModelBuilder
 from utils.point_cloud_util import ObstacleDistanceCalculator
 from utils.traj_planner_global import TrajectoryPlanner
 from utils.hist_obs_buffer import ObsHistBuffer
 from utils.time_report import TimeReport
-import time
 import matplotlib.pyplot as plt
-# squeezenet + trainable linear layer
-import torchvision.models as models
+from models.squeeze_net import VisualPerceptionNet
 
-SINGLE_VISUAL_INPUT_SIZE = 16
-HISTORY_BUFFER_NUM = 5
-LATENT_VECT_NUM = 24
-DEPTH_DATA = False
-
-class VisualPerceptionNet(nn.Module):
-    def __init__(self, input_channels=3):
-        super(VisualPerceptionNet, self).__init__()
-        if DEPTH_DATA:
-            input_channels = 4
-        # Set up the SqueezeNet backbone
-        self.squeezenet = models.squeezenet1_0(pretrained=True)
-        
-        # Modify the first convolution layer to accept more channels (e.g., 4 for RGB + Depth)
-        self.squeezenet.features[0] = nn.Conv2d(input_channels, 96, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
-
-        # Freeze SqueezeNet parameters so they are not updated during training
-        for param in self.squeezenet.parameters():
-            param.requires_grad = False
-
-        # Add an adaptive average pooling to get the output to [batch_size, 512, 1, 1]
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-
-        # Add a 1D convolution layer to downsample from 512 to 32
-        # self.conv1d = nn.Conv1d(512, SINGLE_VISUAL_INPUT_SIZE, kernel_size=1)
-        self.fc = nn.Linear(512, SINGLE_VISUAL_INPUT_SIZE)
-
-    def forward(self, x):
-        # Freeze the SqueezeNet layers but keep the 1D convolution layer trainable
-        with torch.no_grad():
-            x = self.squeezenet.features(x)  # SqueezeNet backbone is frozen
-            x = self.pool(x)  # Adaptive pooling to reduce spatial dimensions to 1x1
-        x = torch.flatten(x, 1)  # Flatten to shape [batch_size, 512]
-        
-        # Conv
-        # x = x.unsqueeze(-1)  # Add a channel dimension for 1D convolution
-        # x = self.conv1d(x).squeeze(-1)  # Apply 1D convolution and remove the extra dimension
-        
-        # FC layer
-        x = self.fc(x)
-
-        return x
 
 
 class DroneLongTrajEnv(DFlexEnv):
@@ -103,17 +50,21 @@ class DroneLongTrajEnv(DFlexEnv):
                  stochastic_init=False, 
                  MM_caching_frequency = 1, 
                  early_termination = True, 
-                 map_name='gate_mid'
+                 map_name='gate_mid',
+                 env_hyper=None,
                  ):
        
-        self.num_privilege_obs = 30 + SINGLE_VISUAL_INPUT_SIZE + LATENT_VECT_NUM
-        num_obs = 17 + SINGLE_VISUAL_INPUT_SIZE + LATENT_VECT_NUM # correspond with self.obs_buf
-        num_act = 4
+        
         self.agent_name = 'drone_long_traj'
-        self.num_history = HISTORY_BUFFER_NUM
-        self.num_latent = LATENT_VECT_NUM
-    
-        print('----------------------------', device)
+        self.num_history = env_hyper.get('HISTORY_BUFFER_NUM', 5)
+        self.num_latent = env_hyper.get('LATENT_VECT_NUM', 24)
+        self.visual_feature_size = env_hyper.get('SINGLE_VISUAL_INPUT_SIZE', 16)
+        self.num_privilege_obs = 27 + self.visual_feature_size + self.num_latent
+        self.num_latent_obs = 17 + self.num_latent + self.visual_feature_size
+        num_obs = 17 + self.num_latent + self.visual_feature_size # correspond with self.obs_buf
+        num_act = 4
+        
+        print(f'device: {device}')
         super(DroneLongTrajEnv, self).__init__(num_envs, num_obs, num_act, episode_length, MM_caching_frequency, seed, no_grad, render, device)
         self.stochastic_init = stochastic_init
         self.early_termination = early_termination
@@ -125,13 +76,8 @@ class DroneLongTrajEnv(DFlexEnv):
 
         # setup map
         maps = {
-            "gate_left":"sv_917_3_left_nerfstudio",
             "gate_right":"sv_917_3_right_nerfstudio",
-            "simple_hover":"sv_917_3_right_nerfstudio",
             "gate_mid":"sv_1007_gate_mid",
-            "clutter":"sv_712_nerfstudio",
-            "backroom":"sv_1018_2",
-            "flightroom":"sv_1018_3",
         }
         self.map_name = map_name
 
@@ -143,6 +89,8 @@ class DroneLongTrajEnv(DFlexEnv):
         self.obs_noise_level = 0.1
         self.br_delay_factor = 0.8
         self.thrust_delay_factor = 0.7
+        self.br_action_strength = 0.5
+        self.thrust_action_strength = 0.25
         self.start_height = 1.25
         self.target_height = 1.3
         self.init_inertia = [0.01, 0.012, 0.025]
@@ -157,26 +105,25 @@ class DroneLongTrajEnv(DFlexEnv):
         self.init_sim()
         self.episode_length = episode_length
 
-        # navigation parameters
-        if self.map_name == 'gate_mid':
-            target = (13.0, -2.0, 1.5) # in map absolute dimension, start with 0
-            target_xy = (13.0, -2.0)
-        if self.map_name == 'gate_left':
-            target = (13.0, -2.0, 1.2) # in map absolute dimension, start with 0
-            target_xy = (13.0, -2.0)
-        if self.map_name == 'gate_right':
-            target = (13.0, -2.0, 1.5) # in map absolute dimension, start with 0
-            target_xy = (13.0, -2.0)
-        if self.map_name == 'simple_hover':
-            target = (3.0, 0.0, 1.2) # in map absolute dimension, start with 0
-            target_xy = (3.0, 0.0)
-        self.target = tu.to_torch(list(target), 
-            device=self.device, requires_grad=True).repeat((self.num_envs, 1)) # navigation target
-        self.target_xy = tu.to_torch(list(target_xy), 
-            device=self.device, requires_grad=True).repeat((self.num_envs, 1)) # navigation target
-        # self.target_list = self.target.clone()
-        self.gs_origin_offset = torch.tensor([[-6.0, -0., -0.05]] * self.num_envs, device=self.device) # (x,y,z); gs dimension for visual info
-        self.point_could_origin_offset = torch.tensor([[-6.0, -0., -0.05]] * self.num_envs, device=self.device) # (x,y,z); point cloud dimension for obstacle distance & traj plan
+        # # Set
+        # if self.map_name == 'gate_mid':
+        #     target = (13.0, -2.0, 1.5) 
+        #     target_xy = (13.0, -2.0)
+        # elif self.map_name == 'gate_left':
+        #     target = (13.0, -2.0, 1.2) 
+        #     target_xy = (13.0, -2.0)
+        # elif self.map_name == 'gate_right':
+        #     target = (13.0, -2.0, 1.5) 
+        #     target_xy = (13.0, -2.0)
+        # else:
+        #     raise ValueError(f"Map {self.map_name} is not supported for navigation target setup.")
+        
+        # self.target = tu.to_torch(list(target), device=self.device, requires_grad=True).repeat((self.num_envs, 1)) # navigation target
+        # self.target_xy = tu.to_torch(list(target_xy), device=self.device, requires_grad=True).repeat((self.num_envs, 1)) # navigation target
+        
+        
+        self.gs_origin_offset = torch.tensor([[-6.0, 0., 0.]] * self.num_envs, device=self.device) # (x,y,z); 3DGS origin on the room center, in training, we set the traj start as origin
+        self.point_could_origin_offset = torch.tensor([[-6.0, 0., 0.]] * self.num_envs, device=self.device) # (x,y,z); point cloud origin on the room center, in training, we set the traj start as origin
 
         # setup point cloud
         script_dir = Path(__file__).parent
@@ -190,7 +137,7 @@ class DroneLongTrajEnv(DFlexEnv):
                                             verbose=False)
         
 
-        # generate ref_traj
+        # Set up navigation goals
         if self.map_name == 'gate_mid':
             self.reward_wp = torch.tensor([
                                         [5.8, -0.1, 1.6],
@@ -201,72 +148,37 @@ class DroneLongTrajEnv(DFlexEnv):
                                         ], device=self.device) # (x,y,z)
             
             
-            # plane the global ref trajectory
+            # plan the global ref trajectory
             traj_wp = self.reward_wp + self.point_could_origin_offset[0].repeat((self.reward_wp.shape[0],1))
             traj_start = torch.tensor([[-6.0, 0, 1.4]], device=self.device)
             traj_dest = torch.tensor([[7.0, -2.0, 1.4]], device=self.device)
             self.ref_traj = self.traj_planner.plan_trajectories(traj_start, traj_dest, [traj_wp])
             self.ref_traj = torch.tensor(self.ref_traj[0], device = self.device)
+            self.target = self.reward_wp[-1].repeat((self.num_envs,1)) 
+            self.target_xy = self.reward_wp[-1, 0:2].repeat((self.num_envs,1)) 
 
-         # generate ref_traj
-        if self.map_name == 'gate_left':
-            self.reward_wp = torch.tensor([[5.8, 1.2, 1.4], 
-                                        [9.7, 1.2, 0.6], 
-                                        [11.8, 0.0, 1.2],
-                                        [13.0, -2.0, 1.2]], device=self.device) # (x,y,z)
-            
-            
-            # plane the global ref trajectory
-            traj_wp = self.reward_wp + self.point_could_origin_offset[0].repeat((self.reward_wp.shape[0],1))
-            traj_start = torch.tensor([[-6.0, 0, 1.2]], device=self.device)
-            traj_dest = torch.tensor([[7.0, -2.0, 1.2]], device=self.device)
-            self.ref_traj = self.traj_planner.plan_trajectories(traj_start, traj_dest, [traj_wp])
-            self.ref_traj = torch.tensor(self.ref_traj[0], device = self.device)
-
-         # generate ref_traj
-        if self.map_name == 'gate_right':
+        elif self.map_name == 'gate_right':
             self.reward_wp = torch.tensor([
                                         [-3.0, -1.0, 1.3],
                                         [6.0, -1.2, 1.5],
                                         [7.8, 0.6, 1.1],
                                         [9.7, 1.4, 0.7],
                                         [11.8, 0, 1.3],
-                                        [13.0, -2., 1.3]
+                                        [13.0, -2., 1.5]
                                         ], device=self.device) # (x,y,z)
 
 
-            # plane the global ref trajectory
+            # plan the global ref trajectory
             traj_wp = self.reward_wp + self.point_could_origin_offset[0].repeat((self.reward_wp.shape[0],1))
             traj_start = torch.tensor([[-6.0, 0, 1.3]], device=self.device)
             traj_dest = torch.tensor([[7.0, -2.0, 1.3]], device=self.device)
             self.ref_traj = self.traj_planner.plan_trajectories(traj_start, traj_dest, [traj_wp])
             self.ref_traj = torch.tensor(self.ref_traj[0], device = self.device)
+            self.target = self.reward_wp[-1].repeat((self.num_envs,1)) 
+            self.target_xy = self.reward_wp[-1, 0:2].repeat((self.num_envs,1)) 
 
-        if self.map_name == 'simple_hover':
-            self.reward_wp = torch.tensor([[3.0, 0.0, 1.2], 
-                                        ], device=self.device) # (x,y,z)
-            
-            
-            # plane the global ref trajectory
-            traj_wp = self.reward_wp + self.point_could_origin_offset[0].repeat((self.reward_wp.shape[0],1))
-            traj_start = torch.tensor([[-6.0, 0, 1.2]], device=self.device)
-            traj_dest = torch.tensor([[-3.0, 0.0, 1.2]], device=self.device)
-            self.ref_traj = self.traj_planner.plan_trajectories(traj_start, traj_dest, [traj_wp])
-            self.ref_traj = torch.tensor(self.ref_traj[0], device = self.device)
-        
-        if self.map_name == 'clutter':
-            self.reward_wp = torch.tensor([
-                              [1.1, -0.6, 1.4],
-                              [6.1, -1.7, 0.6],
-                              [9.4, 1.5, 1.2],
-                              [12.0, -2.3, 1.2]], device=self.device)
-            # plane the global ref trajectory
-            traj_wp = self.reward_wp + self.point_could_origin_offset[0].repeat((self.reward_wp.shape[0],1))
-            traj_start = torch.tensor([[-6.0, 1.0, 1.2]], device=self.device)
-            traj_dest = torch.tensor([[6.0, -2.3, 1.2]], device=self.device)
-            self.ref_traj = self.traj_planner.plan_trajectories(traj_start, traj_dest, [traj_wp])
-            self.ref_traj = torch.tensor(self.ref_traj[0], device = self.device)
-        
+        else:
+            raise ValueError(f"Map {self.map_name} is not supported for reward waypoints setup.")
         
         
         self.reward_wp_list = [self.reward_wp + self.point_could_origin_offset[0].repeat((self.reward_wp.shape[0],1))] * self.num_envs
@@ -274,134 +186,126 @@ class DroneLongTrajEnv(DFlexEnv):
         for i in range(self.reward_wp.shape[0]):
             self.reward_wp_record.append(torch.zeros(self.num_envs, dtype=torch.bool, device=self.device))
         
+        # # Reward parameters
+        # if self.map_name == 'gate_mid':
+        #     self.up_strength = 0.25
+        #     self.heading_strength = 0.75 # reward yaw motion align with lin_vel
+        #     self.lin_vel_penalty = -1.5
+        #     self.lin_vel_rate_penalty = -0.75
+        #     self.action_penalty = -1.0
+        #     self.action_change_penalty = -1.0
+        #     self.smooth_penalty = -1.0
+        #     self.survive_reward = 8.0
+        #     self.pose_penalty = -0.5
+        #     self.height_penalty = -2.0
+        #     self.height_change_penalty = -0.5
+        #     self.jitter_penalty = -0.1
+        #     self.out_map_penalty = -1.5
+        #     self.map_center_penalty = -0.05
+        #     # trajectory
+        #     self.waypoint_strength = 2.0
+        #     self.target_factor = -2.5
+        #     # obstacle avoidance
+        #     self.obstacle_strength = 1.0
+        #     self.collision_penalty_coef = 0.0
+        #     self.collision_penalty = self.collision_penalty_coef*self.survive_reward 
+
         
+        # elif self.map_name == 'gate_right':
+        #     self.up_strength = 0.25
+        #     self.heading_strength = 0.25 # reward yaw motion align with lin_vel
+        #     self.lin_vel_penalty = -2.0
+        #     self.lin_vel_rate_penalty = -0.5
+        #     self.action_penalty = -1.0
+        #     self.action_change_penalty = -1.0
+        #     self.smooth_penalty = -1.0
+        #     self.survive_reward = 8.0
+        #     self.pose_penalty = -0.5
+        #     self.height_penalty = -2.0
+        #     self.height_change_penalty = -0.5
+        #     self.jitter_penalty = -0.1
+        #     self.out_map_penalty = -1.5
+        #     self.map_center_penalty = -0.05
+        #     # trajectory
+        #     self.waypoint_strength = 2.0
+        #     self.target_factor = -2.0
+        #     # obstacle avoidance
+        #     self.obstacle_strength = 1.0
+        #     self.collision_penalty_coef = 0.0
+        #     self.collision_penalty = self.collision_penalty_coef*self.survive_reward 
+
+        # else:
+        #     raise ValueError(f"Map {self.map_name} is not supported for reward parameters setup.")
         
         # Reward parameters
         if self.map_name == 'gate_mid':
-            self.up_strength = 0.25
-            self.heading_strength = 0.75 # reward yaw motion align with lin_vel
-            self.lin_strength = -1.5
-            self.lin_vel_rate_penalty = -0.75
+            self.survive_reward = 8.0
+            self.lin_vel_penalty = -1.5
             self.action_penalty = -1.0
             self.action_change_penalty = -1.0
             self.smooth_penalty = -1.0
-            self.survive_reward = 8.0
             self.pose_penalty = -0.5
             self.height_penalty = -2.0
-            self.height_change_penalty = -0.5
-            self.jitter_penalty = -0.1
-            self.out_map_penalty = -1.5
-            self.map_center_penalty = -0.05
             # trajectory
-            self.waypoint_strength = 2.0
-            self.target_factor = -2.5
+            self.heading_strength = 0.5 # reward yaw motion align with lin_vel
+            self.waypoint_strength = 4.0
+            self.target_factor = -4.0
+            self.out_map_penalty = -1.5
+            # self.map_center_penalty = -0.05
             # obstacle avoidance
             self.obstacle_strength = 1.0
-            self.collision_penalty_coef = 0.0
-            self.collision_penalty = self.collision_penalty_coef*self.survive_reward 
-
+            
         
-        if self.map_name == 'gate_left':
-            self.up_strength = 0.1
-            self.heading_strength = 0.5 # reward yaw motion align with lin_vel
-            self.lin_strength = -0.5
-            self.action_penalty = -0.75
-            self.action_change_penalty = -0.75
+        elif self.map_name == 'gate_right':
             self.survive_reward = 8.0
-            self.height_penalty = -2.0
-            self.height_change_penalty = -0.1
-            self.jitter_penalty = -0.1
-            self.out_map_penalty = -1.5
-            self.map_center_penalty = -0.05
-            # trajectory
-            self.waypoint_strength = 2.0
-            self.target_factor = -3.
-            # obstacle avoidance
-            self.obstacle_strength = 0.5
-            self.collision_penalty_coef = 0.0
-            self.collision_penalty = self.collision_penalty_coef*self.survive_reward 
-        
-        if self.map_name == 'gate_right':
-            self.up_strength = 0.25
-            self.heading_strength = 0.25 # reward yaw motion align with lin_vel
-            self.lin_strength = -2.0
-            self.lin_vel_rate_penalty = -0.5
+            self.lin_vel_penalty = -2.0
             self.action_penalty = -1.0
             self.action_change_penalty = -1.0
             self.smooth_penalty = -1.0
-            self.survive_reward = 8.0
             self.pose_penalty = -0.5
             self.height_penalty = -2.0
-            self.height_change_penalty = -0.5
-            self.jitter_penalty = -0.1
-            self.out_map_penalty = -1.5
-            self.map_center_penalty = -0.05
             # trajectory
-            self.waypoint_strength = 2.0
-            self.target_factor = -2.0
+            self.heading_strength = 0.5 # reward yaw motion align with lin_vel
+            self.waypoint_strength = 4.0
+            self.target_factor = -4.0
+            self.out_map_penalty = -1.5
+            # self.map_center_penalty = -0.05
             # obstacle avoidance
             self.obstacle_strength = 1.0
-            self.collision_penalty_coef = 0.0
-            self.collision_penalty = self.collision_penalty_coef*self.survive_reward 
-
-        if self.map_name == 'simple_hover':
-            self.up_strength = 0.1
-            self.heading_strength = 0.5 # reward yaw motion align with lin_vel
-            self.lin_strength = -2.5
-            self.action_penalty = -0.75
-            self.action_change_penalty = -1.0
-            self.smooth_penalty = -1.0
-            self.survive_reward = 8.0
-            self.height_penalty = -2.0
-            self.height_change_penalty = -0.5
-            self.jitter_penalty = -0.1
-            self.out_map_penalty = -1.5
-            self.map_center_penalty = -0.05
-            # trajectory
-            self.waypoint_strength = 2.5
-            self.target_factor = -3.
-            # obstacle avoidance
-            self.obstacle_strength = 0.75
-            self.collision_penalty_coef = 0.0
-            self.collision_penalty = self.collision_penalty_coef*self.survive_reward 
+            
+        else:
+            raise ValueError(f"Map {self.map_name} is not supported for reward parameters setup.")
+    
         
-       
+        # Navigation parameters
         self.obst_threshold = 0.5
         self.obst_collision_limit = 0.20
         self.body_rate_threshold = 15
         self.domain_randomization = False
 
-
-        self.dt = 0.05 # outter loop RL policy freaquency
         self.map_limit_fact = 1.25
         self.map_x_min = -1.5; self.map_x_max = 13
         self.map_y_min = -2.5; self.map_y_max = 2.5
-        
 
         self.nerf_count = 0
-        self.nerf_freq = 1 # inference nerf every # steps
+        self.gs_freq = 1 
         self.depth_list = 0
-        self.condition_approach = 4
-        self.training_stage = 0
-
-        self.traj_planning_count = 0
         
 
-        #-----------------------
         # Set up visual perception net
-        self.visual_net = VisualPerceptionNet().to(self.device)
+        self.visual_net = VisualPerceptionNet(visual_feature_size=self.visual_feature_size).to(self.device)
+
+        # Set up obs buffer for VAE
         self.obs_hist_buf = ObsHistBuffer(batch_size=self.num_envs,
                                           vector_dim=self.num_obs,
-                                          buffer_size=HISTORY_BUFFER_NUM,
+                                          buffer_size=self.num_history,
                                           device=self.device,
                                           )
 
 
         # Original way pack for record
         self.hyper_parameter = {
-            "up_strength": self.up_strength,
             "heading_strength": self.heading_strength,
-            "lin_strength": self.lin_strength,
             "obstacle_strength": self.obstacle_strength,
             "obst_collision_limit": self.obst_collision_limit,
             "action_penalty": self.action_penalty,
@@ -411,15 +315,9 @@ class DroneLongTrajEnv(DFlexEnv):
             "obst_threshold": self.obst_threshold,
             "survive_reward": self.survive_reward,
             "height_penalty": self.height_penalty,
-            "height_change_penalty": self.height_change_penalty,
             "sim_dt": self.dt,
-            "collision_penalty": self.collision_penalty,
             "waypoint_strength": self.waypoint_strength,
-            "jitter_penalty":self.jitter_penalty,
-            "map_center_penalty": self.map_center_penalty,
             "out_map_penalty": self.out_map_penalty,
-            "collision_penalty_coef":self.collision_penalty_coef,
-            "condition_approach": self.condition_approach,
             "action_change_penalty": self.action_change_penalty,
             "min_mass": self.min_mass,
             "mass_range": self.mass_range,
@@ -433,7 +331,6 @@ class DroneLongTrajEnv(DFlexEnv):
         }
 
         
-        #-----------------------
         # set up Visualization
         self.time_stamp = get_time_stamp()
         self.episode_count = 0
@@ -442,7 +339,6 @@ class DroneLongTrajEnv(DFlexEnv):
             self.save_path = f'{curr_path}/examples/outputs/{self.agent_name}/{self.map_name}/{self.time_stamp}'
             os.makedirs(self.save_path, exist_ok=True)
 
-           
         # recored x, y, depth for test
         self.x_record = []
         self.y_record = []
@@ -465,7 +361,6 @@ class DroneLongTrajEnv(DFlexEnv):
         
 
     def init_sim(self):
-        # self.builder = df.sim.ModelBuilder()
         self.builder = ModelBuilder()
         self.dt = 0.05 # outter loop RL policy freaquency
         self.sim_dt = self.dt
@@ -480,16 +375,13 @@ class DroneLongTrajEnv(DFlexEnv):
 
         if self.map_name == 'gate_mid':
             self.start_rot = np.array([0., 0., 0., 1.]) # (x,y,z,w)
-        if self.map_name == 'gate_left':
+        elif self.map_name == 'gate_right':
             self.start_rot = np.array([0., 0., 0., 1.]) # (x,y,z,w)
-        if self.map_name == 'gate_right':
-            self.start_rot = np.array([0., 0., 0., 1.]) # (x,y,z,w)
-        if self.map_name == 'simple_hover':
-            self.start_rot = np.array([0., 0., 0., 1.]) # (x,y,z,w)
+        else:
+            raise ValueError(f"Map {self.map_name} is not supported for start rotation setup.")
         self.start_rotation = tu.to_torch(self.start_rot, device=self.device, requires_grad=False)
 
-        # initialize some data used later on
-        # todo - switch to z-up
+        # initialize deynamics helper variables
         self.up_vec = self.z_unit_tensor.clone()
         self.heading_vec = self.x_unit_tensor.clone()
         self.inv_start_rot = tu.quat_conjugate(self.start_rotation).repeat((self.num_envs, 1))
@@ -506,42 +398,35 @@ class DroneLongTrajEnv(DFlexEnv):
 
         # Initialize the QuadrotorSimulator
         self.quad_dynamics = QuadrotorSimulator(
-            mass=self.mass,  # Shape: (batch_size,)
-            inertia=self.inertia,  # Shape: (batch_size, 3, 3)
-            link_length=link_length,  # Scalar
-            Kp=Kp,  # Shape: (batch_size, 3)
-            Kd=Kd,  # Shape: (batch_size, 3)
-            freq=200.0,  # Scalar
-            max_thrust=self.max_thrust,  # Shape: (batch_size,)
-            total_time=self.sim_dt,  # Scalar
-            rotor_noise_std=0.01,  # Scalar
-            br_noise_std=0.01  # Scalar
+            mass=self.mass,  
+            inertia=self.inertia,  
+            link_length=link_length,  
+            Kp=Kp,  
+            Kd=Kd, 
+            freq=200.0,  
+            max_thrust=self.max_thrust,  
+            total_time=self.sim_dt,  
+            rotor_noise_std=0.01,  
+            br_noise_std=0.01  
         )
         
         if self.map_name == 'gate_mid':
-            # start_pos_x = -0.5; start_pos_y = 0.5
-            # start_pos_x = -1.0; start_pos_y = -1.0
             start_pos_x = 0.0; start_pos_y = 0.0
             self.start_body_rate = [0., 0., 0.]
-        if self.map_name == 'gate_left':
+        elif self.map_name == 'gate_right':
             start_pos_x = 0.0; start_pos_y = 0.0
             self.start_body_rate = [0., 0., 0.]
-        if self.map_name == 'gate_right':
-            start_pos_x = 0.0; start_pos_y = 0.0
-            self.start_body_rate = [0., 0., 0.]
-        if self.map_name == 'simple_hover':
-            start_pos_x = -0.0; start_pos_y = -0.0
-            self.start_body_rate = [0., 0., 0.]
+        else:
+            raise ValueError(f"Map {self.map_name} is not supported for start position setup.")
+        
 
         self.start_pos = []
-        # self.start_body_rate = [0., 0., 0.] # r,p,y
         self.start_norm_thrust = [(self.hover_thrust / self.max_thrust).clone().detach().cpu().numpy()[0]]
         self.control_base = self.start_norm_thrust[0]
         self.start_action = self.start_body_rate + self.start_norm_thrust
         
 
         for i in range(self.num_environments):
-            # start_pos_y = i*self.env_dist
             start_pos = [start_pos_x, start_pos_y, self.start_height, ]
             self.start_pos.append(start_pos)
 
@@ -561,15 +446,13 @@ class DroneLongTrajEnv(DFlexEnv):
         self.state_joint_qd = torch.zeros([self.num_envs, 6], device=self.device) # lin_velo + ang_velo
         self.state_joint_qdd = torch.zeros([self.num_envs, 6], device=self.device) # lin_acc + ang_acc
         
-        self.latent_vect = torch.zeros([self.num_envs, LATENT_VECT_NUM], device=self.device, dtype = torch.float)
-        self.lin_vel_vae = torch.zeros([self.num_envs, 3], device=self.device, dtype = torch.float)
+        self.latent_vect = torch.zeros([self.num_envs, self.num_latent], device=self.device, dtype = torch.float)
         self.prev_lin_vel = torch.zeros([self.num_envs, 3], device=self.device, dtype = torch.float)
 
     
     # Forward simulation of the trajectory
-    def step(self, actions, vae_info, vel_net_info):
-        self.latent_vect, _ = vae_info[0].clone().detach(), vae_info[1].clone().detach()
-        self.lin_vel_vae = vel_net_info[0].clone().detach()
+    def step(self, actions, vae_info):
+        self.latent_vect = vae_info.clone().detach()
 
         # prepare vae data
         self.obs_hist_buf.update(self.vae_obs_buf)
@@ -577,15 +460,14 @@ class DroneLongTrajEnv(DFlexEnv):
         obs_vel = self.privilege_obs_buf[:, 3:6].clone().detach()
 
         actions = actions.view((self.num_envs, self.num_actions))
-        body_rate_cols = torch.clip(actions[:, 0:3], -1., 1.) * 0.5
+        body_rate_cols = torch.clip(actions[:, 0:3], -1., 1.) * self.br_action_strength
 
         # Process actions
         prev_body_rate = self.prev_actions[:, 0:3].clone().detach()
-        body_rate_cols = self.br_delay_factor*(torch.clip(actions[:, 0:3], -1., 1.) * 0.5) + (1-self.br_delay_factor)*prev_body_rate
-        body_rate_cols = torch.clip(body_rate_cols, -0.5, 0.5) # limit the body rate
+        body_rate_cols = self.br_delay_factor*(torch.clip(actions[:, 0:3], -1., 1.) * self.br_action_strength) + (1-self.br_delay_factor)*prev_body_rate
+        body_rate_cols = torch.clip(body_rate_cols, -0.5, 0.5) 
         prev_thrust = self.prev_actions[:, -1].unsqueeze(-1).clone().detach()
-        thrust_col = self.thrust_delay_factor*((torch.clip(actions[:, 3:],-1., 1.) + 1) * 0.25) + \
-            (1-self.thrust_delay_factor)*prev_thrust # rough simulation of motor delay, thrust range is [0, 0.5]
+        thrust_col = self.thrust_delay_factor*((torch.clip(actions[:, 3:],-1., 1.) + 1) * self.thrust_action_strength) + (1-self.thrust_delay_factor)*prev_thrust 
 
         actions = torch.cat([body_rate_cols, thrust_col], dim=1)
         self.prev_prev_actions = self.prev_actions.clone()
@@ -595,23 +477,23 @@ class DroneLongTrajEnv(DFlexEnv):
         
         # Update the state variables
         torso_pos = self.state_joint_q.view(self.num_envs, -1)[:, 0:3] # (x, y, z)
-        torso_quat = self.state_joint_q.view(self.num_envs, -1)[:, 3:7] # rotated 90 deg
-        lin_vel = self.state_joint_qd.view(self.num_envs, -1)[:, 3:6] # joint_qd rot has 3 entries
+        torso_quat = self.state_joint_q.view(self.num_envs, -1)[:, 3:7] 
+        lin_vel = self.state_joint_qd.view(self.num_envs, -1)[:, 3:6] 
         ang_vel = self.state_joint_qd.view(self.num_envs, -1)[:, 0:3]
-        lin_acc = self.state_joint_qdd.view(self.num_envs, -1)[:, 3:6] # joint_qd rot has 3 entries
+        lin_acc = self.state_joint_qdd.view(self.num_envs, -1)[:, 3:6]
         ang_acc = self.state_joint_qdd.view(self.num_envs, -1)[:, 0:3]
         
         # Core dynamic simulation
         self.time_report.start_timer("dynamic simulation")
         new_position, new_linear_velocity, new_angular_velocity, new_quaternion, new_linear_acceleration, new_angular_acceleration = \
         self.quad_dynamics.run_simulation(
-                                            position=torso_pos,
-                                            velocity=lin_vel,
-                                            orientation=torso_quat[:, [3,0,1,2]], # (w, x, y, z)
-                                            angular_velocity=ang_vel,
-                                            control_input=control_input
-                                        )
-        self.time_report.end_timer("dynamic simulation")        # set new state back
+            position=torso_pos,
+            velocity=lin_vel,
+            orientation=torso_quat[:, [3,0,1,2]], # (w, x, y, z)
+            angular_velocity=ang_vel,
+            control_input=control_input
+        )
+        self.time_report.end_timer("dynamic simulation")        
         if self.no_grad:
             new_position = new_position.detach()
             new_quaternion = new_quaternion.detach()
@@ -670,28 +552,28 @@ class DroneLongTrajEnv(DFlexEnv):
 
                 # Randomize mass, max_thrust, and inertia for the specified environments
                 num_reset_envs = len(env_ids)
-                mass_with_noise = torch.rand(num_reset_envs, device=self.device) * self.mass_range + self.min_mass  # Uniform noise between 1.0 to 1.2
+                mass_with_noise = torch.rand(num_reset_envs, device=self.device) * self.mass_range + self.min_mass  
                 self.mass[env_ids] = mass_with_noise
-                max_thrust_with_noise = torch.rand(num_reset_envs, device=self.device) * self.thrust_range + self.min_thrust  # Uniform noise between 24 and 26
+                max_thrust_with_noise = torch.rand(num_reset_envs, device=self.device) * self.thrust_range + self.min_thrust  
                 self.max_thrust[env_ids] = max_thrust_with_noise
-                inertia = torch.tensor(self.init_inertia, device=self.device)  # Base inertia
+                inertia = torch.tensor(self.init_inertia, device=self.device)  
                 inertial_noise = (torch.rand(num_reset_envs, 3, device=self.device) - 0.5) * 2 * 0.2 * inertia  # ±20% noise
                 randomized_inertia = inertia + inertial_noise
-                self.inertia[env_ids] = torch.diag_embed(randomized_inertia)  # Shape: (num_reset_envs, 3, 3)
+                self.inertia[env_ids] = torch.diag_embed(randomized_inertia)  
                 self.hover_thrust[env_ids] = self.mass[env_ids] * 9.81
 
                 # Reinitialize QuadrotorSimulator with updated parameters
                 self.quad_dynamics = QuadrotorSimulator(
-                    mass=self.mass,  # Shape: (batch_size,)
-                    inertia=self.inertia,  # Shape: (batch_size, 3, 3)
-                    link_length=0.15,  # Scalar
-                    Kp=torch.tensor(self.init_kp, device=self.device).unsqueeze(0).repeat(self.num_envs, 1),  # Shape: (batch_size, 3)
-                    Kd=torch.tensor(self.init_kd, device=self.device).unsqueeze(0).repeat(self.num_envs, 1),  # Shape: (batch_size, 3)
-                    freq=200.0,  # Scalar
-                    max_thrust=self.max_thrust,  # Shape: (batch_size,)
-                    total_time=self.sim_dt,  # Scalar
-                    rotor_noise_std=0.01,  # Scalar
-                    br_noise_std=0.01  # Scalar
+                    mass=self.mass,  
+                    inertia=self.inertia,  
+                    link_length=0.15,  
+                    Kp=torch.tensor(self.init_kp, device=self.device).unsqueeze(0).repeat(self.num_envs, 1), 
+                    Kd=torch.tensor(self.init_kd, device=self.device).unsqueeze(0).repeat(self.num_envs, 1),  
+                    freq=200.0,  
+                    max_thrust=self.max_thrust,  
+                    total_time=self.sim_dt,  
+                    rotor_noise_std=0.01,  
+                    br_noise_std=0.01 
                 )
 
                 self.start_norm_thrust = [(self.hover_thrust / self.max_thrust).clone().detach().cpu().numpy()[0]]
@@ -699,12 +581,12 @@ class DroneLongTrajEnv(DFlexEnv):
                 self.start_action = self.start_body_rate + self.start_norm_thrust
                 self.start_joint_q = tu.to_torch(self.start_action, device=self.device)
             
-            # clone the state to avoid gradient error
+            # Clone the state to avoid gradient error
             self.state_joint_q = self.state_joint_q.clone()
             self.state_joint_qd = self.state_joint_qd.clone()
             self.state_joint_qdd = self.state_joint_qdd.clone()
 
-            # fixed start state
+            # Alternatively, fixed start state
             self.state_joint_q[env_ids, 0:3] = self.start_pos[env_ids, :].clone()
             self.state_joint_q.view(self.num_envs, -1)[env_ids, 3:7] = self.start_rotation.clone()
             self.state_joint_qd.view(self.num_envs, -1)[env_ids, :] = 0.
@@ -713,7 +595,7 @@ class DroneLongTrajEnv(DFlexEnv):
             self.prev_actions.view(self.num_envs, -1)[env_ids, :] = self.start_joint_q.clone()
             self.prev_prev_actions.view(self.num_envs, -1)[env_ids, :] = self.start_joint_q.clone()
 
-            # randomization
+            # Randomization
             if not self.visualize and self.stochastic_init:
                 self.state_joint_q.view(self.num_envs, -1)[env_ids, 0:3] = self.state_joint_q.view(self.num_envs, -1)[env_ids, 0:3] + 0.5 * (torch.rand(size=(len(env_ids), 3), device=self.device) - 0.5) * 2.
                 angle = (torch.rand(len(env_ids), device = self.device) - 0.5) * np.pi / 12.
@@ -725,19 +607,14 @@ class DroneLongTrajEnv(DFlexEnv):
                 self.prev_actions.view(self.num_envs, -1)[env_ids, :] = self.start_joint_q.clone()
                 self.prev_prev_actions.view(self.num_envs, -1)[env_ids, :] = self.start_joint_q.clone()
 
-
             # clear VAE variables
-            self.latent_vect[env_ids] = torch.zeros([len(env_ids), LATENT_VECT_NUM], device=self.device, dtype = torch.float)
-            self.lin_vel_vae[env_ids] = torch.zeros([len(env_ids), 3], device=self.device, dtype = torch.float)
+            self.latent_vect[env_ids] = torch.zeros([len(env_ids), self.num_latent], device=self.device, dtype = torch.float)
 
             self.progress_buf[env_ids] = 0
             self.calculateObservations()
 
         return self.obs_buf
     
-    '''
-    cut off the gradient from the current state to previous states
-    '''
     def clear_grad(self, checkpoint = None):
         with torch.no_grad():
             if checkpoint is None:
@@ -749,7 +626,6 @@ class DroneLongTrajEnv(DFlexEnv):
                 checkpoint['prev_prev_actions'] = self.prev_prev_actions.clone()
                 checkpoint['progress_buf'] = self.progress_buf.clone()
                 checkpoint['latent_vect'] = self.latent_vect.clone()
-                checkpoint['lin_vel_vae'] = self.lin_vel_vae.clone()
                 checkpoint['prev_lin_vel'] = self.prev_lin_vel
 
             current_joint_q = checkpoint['joint_q'].clone()
@@ -762,17 +638,11 @@ class DroneLongTrajEnv(DFlexEnv):
             self.prev_prev_actions = checkpoint['prev_prev_actions'].clone()
             self.progress_buf = checkpoint['progress_buf'].clone()
             self.latent_vect = checkpoint['latent_vect'].clone()
-            self.lin_vel_vae = checkpoint['lin_vel_vae'].clone()
             self.prev_lin_vel = checkpoint['prev_lin_vel'].clone()
 
-    '''
-    This function starts collecting a new trajectory from the current states but cuts off the computation graph to the previous states.
-    It has to be called every time the algorithm starts an episode and it returns the observation vectors
-    '''
     def initialize_trajectory(self):
         self.clear_grad()
         self.calculateObservations()
-
         return self.obs_buf, self.privilege_obs_buf
 
     def get_checkpoint(self):
@@ -784,40 +654,19 @@ class DroneLongTrajEnv(DFlexEnv):
         checkpoint['prev_prev_actions'] = self.prev_prev_actions.clone()
         checkpoint['progress_buf'] = self.progress_buf.clone()
         checkpoint['latent_vect'] = self.latent_vect.clone()
-        checkpoint['lin_vel_vae'] = self.lin_vel_vae.clone()
         checkpoint['prev_lin_vel'] = self.prev_lin_vel.clone()
-
         return checkpoint
     
-    def process_GS_data(self, depth_list, nerf_img):
-        # min depth from nerf
+    def process_GS_data(self, depth_list, rgb_img):
         batch,H,W,ch = depth_list.shape
         depth_list_up = depth_list[:,0:int(H/2),:,:]
-        self.depth_list = torch.abs(torch.amin(depth_list_up,dim=(1,2,3))) 
-        self.depth_list = self.depth_list.unsqueeze(1)
-        self.depth_list = self.depth_list.to(device=self.device)
-        # rgb from nerf
-        input_tensor = nerf_img.permute(0, 3, 1, 2)
-        depth_tensor = depth_list.permute(0, 3, 1, 2)  # Make sure depth_list is [batch_size, channels, height, width]
-        depth_tensor = torch.clip(depth_tensor, 0.0, 2.5) # match the realsense hardware limit
+        self.depth_list = torch.abs(torch.amin(depth_list_up,dim=(1,2,3))).unsqueeze(1).to(device=self.device)
+        visual_tensor = rgb_img.permute(0, 3, 1, 2)
         
-        if DEPTH_DATA:
-            # Concatenate RGB image and depth data along the channel dimension
-            combined_tensor = torch.cat([input_tensor, depth_tensor], dim=1)
-            # Resize to match SqueezeNet input size
-            resize = nn.AdaptiveAvgPool2d((224, 224))
-            combined_tensor = resize(combined_tensor)
-            combined_tensor = combined_tensor.to(self.device)
-            self.visual_info = self.visual_net(combined_tensor)
-            self.visual_info = self.visual_info.detach()
-        else:
-            # Only use RGB
-            resize = nn.AdaptiveAvgPool2d((224, 224))
-            input_tensor = resize(input_tensor)
-            input_tensor = input_tensor.to(self.device)
-            self.visual_info = self.visual_net(input_tensor)
-            self.visual_info = self.visual_info.detach()
-
+        # Get visual feature with CNN
+        resize = nn.AdaptiveAvgPool2d((224, 224))
+        visual_tensor = resize(visual_tensor).to(self.device)
+        self.visual_info = self.visual_net(visual_tensor).detach()
 
 
     def calculateObservations(self):
@@ -826,21 +675,12 @@ class DroneLongTrajEnv(DFlexEnv):
         lin_vel = self.state_joint_qd.view(self.num_envs, -1)[:, 3:6] # joint_qd rot has 3 entries
         ang_vel = self.state_joint_qd.view(self.num_envs, -1)[:, 0:3]
         lin_acceleration = self.state_joint_qdd.view(self.num_envs, -1)[:, 3:6]
-        ang_acceleration = self.state_joint_qdd.view(self.num_envs, -1)[:, 0:3]
-
-        # convert the linear velocity of the torso from twist representation to the velocity of the center of mass in world frame
-        to_target =  + self.start_pos - torso_pos
-        to_target[:, 2] = 0.0
         
-        # target_dirs = tu.normalize(to_target)
         target_dirs = tu.normalize(lin_vel[:, 0:2].clone())
         up_vec = tu.quat_rotate(torso_quat.clone(), self.up_vec)
-        up_vec_ablation = torch.zeros_like(up_vec)
-        # heading_vec = tu.quat_rotate(torso_quat, self.heading_vec)
         rpy = quaternion_to_euler(torso_quat[:, [3,0,2,1]]) # input is (w,x,z,y)
         heading_vec = torch.cat([torch.cos(rpy[:,2].unsqueeze(-1)), torch.sin(rpy[:,2].unsqueeze(-1))], dim=1) 
 
-        # Parallized implementation
         gs_pos = torso_pos + self.gs_origin_offset # (x, y, z)
         gs_pos[:, 1] = -gs_pos[:, 1]
         gs_pos[:, 2] = -gs_pos[:, 2]
@@ -849,66 +689,59 @@ class DroneLongTrajEnv(DFlexEnv):
 
 
         if not self.visualize:
-            # Nerf info processing
-            if self.nerf_count % self.nerf_freq == 0: # infer nerf every nerf_freq steps
+            # get visual data from 3DGS
+            if self.nerf_count % self.gs_freq == 0:
                 self.time_report.start_timer("3D GS inference")
-                depth_list, nerf_img = self.gs.render(gs_pose) # (batch_size,H,W,1/3)
-                self.process_GS_data(depth_list, nerf_img)
+                depth_list, rgb_img = self.gs.render(gs_pose) # (batch_size,H,W,1/3)
+                self.process_GS_data(depth_list, rgb_img)
                 self.time_report.end_timer("3D GS inference")
             self.nerf_count += 1            
             
-        # Draw record plot for data visualization
+        # Update records for visualization
         if self.visualize:
-            img_transform = Resize((360, 640), antialias=True)
+            self.record_visualization_data(gs_pose, torso_pos, ang_vel, lin_vel, rpy_data)
 
-            # ---------------------------------------
-            # Normal test mode
-            # NeRF data
-            depth_list, nerf_img = self.gs.render(gs_pose) # (batch_size,H,W,1/3)
-            self.process_GS_data(depth_list, nerf_img)
+            # img_transform = Resize((360, 640), antialias=True)
+            # depth_list, rgb_img = self.gs.render(gs_pose) # (batch_size,H,W,1/3)
+            # self.process_GS_data(depth_list, rgb_img)
 
-            # Visualization
-            # rgb from nerf
-            nerf_img = torch.permute(nerf_img[0], (2,0,1))
-            img = img_transform(nerf_img)
+            # # Visualization
+            # # rgb from nerf
+            # rgb_img = torch.permute(rgb_img[0], (2,0,1))
+            # img = img_transform(rgb_img)
 
-            pos_data = torso_pos.clone()
-            pos_data = pos_data.detach().cpu().numpy()
-            depth_data = self.depth_list.clone()
-            depth_data = depth_data.detach().cpu().numpy()
-            action_data = self.actions.clone().detach().cpu().numpy()
-            ang_vel_data = ang_vel.clone().detach().cpu().numpy()
-            # velo_data = lin_vel_new.clone().detach().cpu().numpy()
-            vae_velo_data = self.lin_vel_vae.clone().detach().cpu().numpy()
-            velo_data = lin_vel.clone().detach().cpu().numpy()
+            # pos_data = torso_pos.clone()
+            # pos_data = pos_data.detach().cpu().numpy()
+            # depth_data = self.depth_list.clone()
+            # depth_data = depth_data.detach().cpu().numpy()
+            # action_data = self.actions.clone().detach().cpu().numpy()
+            # ang_vel_data = ang_vel.clone().detach().cpu().numpy()
+            # # velo_data = lin_vel_new.clone().detach().cpu().numpy()
+            # velo_data = lin_vel.clone().detach().cpu().numpy()
 
-            self.x_record.append(pos_data[0, 0])
-            self.y_record.append(pos_data[0, 1])
-            self.z_record.append(pos_data[0, 2])
-            self.roll_record.append(rpy_data[0, 0])
-            self.pitch_record.append(rpy_data[0, 1])
-            self.yaw_record.append(rpy_data[0, 2])
-            self.velo_x_record.append(velo_data[0, 0])
-            self.velo_y_record.append(velo_data[0, 1])
-            self.velo_z_record.append(velo_data[0, 2])
-            self.ang_velo_x_record.append(ang_vel_data[0, 0])
-            self.ang_velo_y_record.append(ang_vel_data[0, 1])
-            self.ang_velo_z_record.append(ang_vel_data[0, 2])
-            self.vae_velo_x_record.append(vae_velo_data[0, 0])
-            self.vae_velo_y_record.append(vae_velo_data[0, 1])
-            self.vae_velo_z_record.append(vae_velo_data[0, 2])
-            self.depth_record.append(depth_data[0]/2)
-            self.img_record.append(img)
-            if self.episode_count < self.episode_length:
-                self.action_record[self.episode_count,:] = action_data
-            self.episode_count += 1
+            # self.x_record.append(pos_data[0, 0])
+            # self.y_record.append(pos_data[0, 1])
+            # self.z_record.append(pos_data[0, 2])
+            # self.roll_record.append(rpy_data[0, 0])
+            # self.pitch_record.append(rpy_data[0, 1])
+            # self.yaw_record.append(rpy_data[0, 2])
+            # self.velo_x_record.append(velo_data[0, 0])
+            # self.velo_y_record.append(velo_data[0, 1])
+            # self.velo_z_record.append(velo_data[0, 2])
+            # self.ang_velo_x_record.append(ang_vel_data[0, 0])
+            # self.ang_velo_y_record.append(ang_vel_data[0, 1])
+            # self.ang_velo_z_record.append(ang_vel_data[0, 2])
+            # self.vae_velo_x_record.append(vae_velo_data[0, 0])
+            # self.vae_velo_y_record.append(vae_velo_data[0, 1])
+            # self.vae_velo_z_record.append(vae_velo_data[0, 2])
+            # self.depth_record.append(depth_data[0]/2)
+            # self.img_record.append(img)
+            # if self.episode_count < self.episode_length:
+            #     self.action_record[self.episode_count,:] = action_data
+            # self.episode_count += 1
 
         # Abalation variables        
         latent_abalation = torch.zeros_like(self.latent_vect)
-        torso_rot_ablation = torch.zeros_like(torso_quat)
-        ang_vel_ablation = torch.zeros_like(ang_vel)
-        lin_vel_ablation = torch.zeros_like(lin_vel)
-        torso_pos_ablation = torch.zeros_like(torso_pos)
 
         # adding noise
         torso_pos_noise = self.obs_noise_level * (torch.rand_like(torso_pos)-0.5)
@@ -919,8 +752,7 @@ class DroneLongTrajEnv(DFlexEnv):
 
         self.privilege_obs_buf = torch.cat([
                                 torso_pos[:, :], # 0:3 
-                                # lin_vel_new, # 3:6
-                                lin_vel,
+                                lin_vel, # 3:6
                                 lin_acceleration, # acc 6:9 
                                 torso_quat, # 9:13
                                 ang_vel, # 13:16
@@ -931,7 +763,6 @@ class DroneLongTrajEnv(DFlexEnv):
                                 self.depth_list, # 26
                                 self.visual_info, # 27:51
                                 self.latent_vect, # 51:67
-                                self.lin_vel_vae,
                                 ], 
                                 dim = -1)
 
@@ -960,7 +791,7 @@ class DroneLongTrajEnv(DFlexEnv):
                                 ], 
                                 dim = -1)
         
-        # ugly fix of simulation (usually z_acc inf) 
+        # Senity check
         if (torch.isnan(self.obs_buf).any() | torch.isinf(self.obs_buf).any()):
             print('nan')
             self.obs_buf = torch.nan_to_num(self.obs_buf, nan=0.0, posinf=1e3, neginf=-1e3)
@@ -997,19 +828,16 @@ class DroneLongTrajEnv(DFlexEnv):
         smooth_penalty += torch.sum(torch.square((self.obs_buf[:, 9] - 2*self.obs_buf[:, 13] + self.prev_prev_actions[:, 3]))) * (2*self.smooth_penalty)
 
         # State related rewards
-        lin_vel_reward = self.lin_strength * torch.sum(torch.square(self.obs_buf[:, 14:17]), dim=-1) 
-        velo_rate_penalty = torch.sum(torch.square(self.prev_lin_vel - self.obs_buf[:, 14:17]), dim=-1) * self.lin_vel_rate_penalty
+        lin_vel_reward = self.lin_vel_penalty * torch.sum(torch.square(self.obs_buf[:, 14:17]), dim=-1) 
         pose_penalty = torch.sum(torch.abs(self.obs_buf[:, 2:6] - self.start_rotation), dim=-1) * self.pose_penalty
         height_penalty = torch.square(self.obs_buf[:,0] - self.target_height) * self.height_penalty
-        height_change_penalty = torch.square(self.obs_buf[:,1]) * self.height_change_penalty
-        jitter_penalty = torch.square(self.privilege_obs_buf[:,8]) * self.jitter_penalty 
         out_map_penalty = (
             torch.clamp(self.map_x_min - self.privilege_obs_buf[:, 0], min=0) ** 2 +
             torch.clamp(self.privilege_obs_buf[:, 0] - self.map_x_max, min=0) ** 2 +
             torch.clamp(self.map_y_min - self.privilege_obs_buf[:, 1], min=0) ** 2 +
             torch.clamp(self.privilege_obs_buf[:, 1] - self.map_y_max, min=0) ** 2
         ) * self.out_map_penalty 
-        map_center_penalty = torch.square(self.privilege_obs_buf[:,2]) * self.map_center_penalty 
+        # map_center_penalty = torch.square(self.privilege_obs_buf[:,2]) * self.map_center_penalty 
 
         # Navigation related rewards
         # Reward getting close to waypoints
@@ -1018,29 +846,29 @@ class DroneLongTrajEnv(DFlexEnv):
             waypoint = waypoint.repeat((self.num_envs,1))
             distances = torch.norm(self.privilege_obs_buf[:, 0:3] - waypoint, dim=1)**2
             factor = (torch.exp(1 / (distances+torch.ones(self.num_envs, device=self.device))) - torch.ones(self.num_envs, device=self.device)) # 0-1
-            # factor = torch.exp(-distances) # 0-1
             wp_reward += factor * self.waypoint_strength
 
         # Reward tracking reference trajectory
-        ref_x = self.privilege_obs_buf[:, 0] + self.point_could_origin_offset[0, 0]  # Shape: [num_envs]
-        ref_traj_x = self.ref_traj[:, 0]  # Shape: [ref_traj_length]
-        diff = ref_traj_x.unsqueeze(0) - ref_x.unsqueeze(1)  # Shape: [num_envs, ref_traj_length]
-        mask = diff > 0.5  # Shape: [num_envs, ref_traj_length]
-        diff_masked = torch.where(mask, diff, float('inf'))  # Shape: [num_envs, ref_traj_length]
-        min_diffs, min_indices = torch.min(diff_masked, dim=1)  # Shapes: [num_envs], [num_envs]
-        no_valid_indices = torch.isinf(min_diffs)  # Shape: [num_envs]
+        ref_x = self.privilege_obs_buf[:, 0] + self.point_could_origin_offset[0, 0]  
+        ref_traj_x = self.ref_traj[:, 0]  
+        diff = ref_traj_x.unsqueeze(0) - ref_x.unsqueeze(1)  
+        mask = diff > 0.5  
+        diff_masked = torch.where(mask, diff, float('inf'))  
+        min_diffs, min_indices = torch.min(diff_masked, dim=1)  
+        no_valid_indices = torch.isinf(min_diffs)  
         target_list = torch.empty((self.num_envs, 3), device=self.device)
-        default_target = self.target[0] + self.point_could_origin_offset[0]  # Shape: [3]
+        default_target = self.target[0] + self.point_could_origin_offset[0]  
         target_list[:] = default_target
         valid_indices = ~no_valid_indices
         selected_indices = min_indices[valid_indices]
-        targets = self.ref_traj[selected_indices]  # Shape: [num_valid_envs, 3]
+        targets = self.ref_traj[selected_indices] 
         target_list[valid_indices] = targets
         target_list = target_list - self.point_could_origin_offset
 
         desire_velo_norm = (target_list - self.privilege_obs_buf[:, 0:3]) / torch.clamp(torch.norm(target_list - self.privilege_obs_buf[:, 0:3], dim=1, keepdim=True), min=1e-6)
         curr_velo_norm = self.obs_buf[:, 14:17] / torch.clamp(torch.norm(self.obs_buf[:, 14:17], dim=1, keepdim=True), min=1e-2)
-        velo_dist = torch.linalg.norm(curr_velo_norm - desire_velo_norm, dim=1)
+        # velo_dist = torch.linalg.norm(curr_velo_norm - desire_velo_norm, dim=1)
+        velo_dist = torch.norm(curr_velo_norm - desire_velo_norm, dim=1)
         target_reward = velo_dist * self.target_factor
 
         # Obstacle avoidance reward
@@ -1050,16 +878,32 @@ class DroneLongTrajEnv(DFlexEnv):
         self.time_report.end_timer("point cloud collision check")
         # reward larger distance away from obstacles
         obst_reward = obst_reward + torch.where(obst_dist < self.obst_threshold, obst_dist*self.obstacle_strength, torch.zeros_like(obst_dist))
-        # penalty collision
-        obst_reward = obst_reward + torch.where(obst_dist < self.obst_collision_limit, torch.ones_like(obst_dist)*self.collision_penalty, torch.zeros_like(obst_dist))
         
+
+        # self.rew_buf = (
+        #                 survive_reward + 
+        #                 obst_reward + 
+        #                 pose_penalty +
+        #                 lin_vel_reward + 
+        #                 velo_rate_penalty +
+        #                 heading_reward + 
+        #                 target_reward + 
+        #                 action_penalty + 
+        #                 action_change_penalty +
+        #                 smooth_penalty +
+        #                 height_penalty + 
+        #                 out_map_penalty + 
+        #                 map_center_penalty +
+        #                 height_change_penalty +
+        #                 jitter_penalty +
+        #                 wp_reward 
+        #                 )
 
         self.rew_buf = (
                         survive_reward + 
                         obst_reward + 
                         pose_penalty +
                         lin_vel_reward + 
-                        velo_rate_penalty +
                         heading_reward + 
                         target_reward + 
                         action_penalty + 
@@ -1067,16 +911,11 @@ class DroneLongTrajEnv(DFlexEnv):
                         smooth_penalty +
                         height_penalty + 
                         out_map_penalty + 
-                        map_center_penalty +
-                        height_change_penalty +
-                        jitter_penalty +
                         wp_reward 
                         )
             
         
         # Early termination settings
-        # condition_dist = (obst_dist < self.obst_collision_limit)
-        # condition_loss = (self.rew_buf < -10)
         condition_senity = ~(( ~torch.isnan(self.obs_buf)& ~torch.isinf(self.obs_buf)).all(dim=1))
         condition_body_rate = torch.linalg.norm(self.privilege_obs_buf[:,10:13], dim=1) > self.body_rate_threshold
         condition_height = (self.privilege_obs_buf[:,2] > 4.) | (self.privilege_obs_buf[:,2] < 0.)
@@ -1098,8 +937,40 @@ class DroneLongTrajEnv(DFlexEnv):
             if self.episode_count == (self.episode_length-1) or combined_condition.any():
                 self.save_recordings()
 
-    
 
+    def record_visualization_data(self, gs_pose, torso_pos, ang_vel, lin_vel, rpy_data):
+        img_transform = Resize((360, 640), antialias=True)
+        depth_list, rgb_img = self.gs.render(gs_pose)  # (batch_size, H, W, 1/3)
+        self.process_GS_data(depth_list, rgb_img)
+
+        # Visualization
+        rgb_img = torch.permute(rgb_img[0], (2, 0, 1))
+        img = img_transform(rgb_img)
+
+        pos_data = torso_pos.clone().detach().cpu().numpy()
+        depth_data = depth_list.clone().detach().cpu().numpy()
+        action_data = self.actions.clone().detach().cpu().numpy()
+        ang_vel_data = ang_vel.clone().detach().cpu().numpy()
+        velo_data = lin_vel.clone().detach().cpu().numpy()
+
+        self.x_record.append(pos_data[0, 0])
+        self.y_record.append(pos_data[0, 1])
+        self.z_record.append(pos_data[0, 2])
+        self.roll_record.append(rpy_data[0, 0])
+        self.pitch_record.append(rpy_data[0, 1])
+        self.yaw_record.append(rpy_data[0, 2])
+        self.velo_x_record.append(velo_data[0, 0])
+        self.velo_y_record.append(velo_data[0, 1])
+        self.velo_z_record.append(velo_data[0, 2])
+        self.ang_velo_x_record.append(ang_vel_data[0, 0])
+        self.ang_velo_y_record.append(ang_vel_data[0, 1])
+        self.ang_velo_z_record.append(ang_vel_data[0, 2])
+        self.depth_record.append(depth_data[0] / 2)
+        self.img_record.append(img)
+
+        if self.episode_count < self.episode_length:
+            self.action_record[self.episode_count, :] = action_data
+        self.episode_count += 1
 
     def save_recordings(self):
         save_path = self.save_path
@@ -1159,9 +1030,6 @@ class DroneLongTrajEnv(DFlexEnv):
         plt.plot(range(len(self.velo_x_record)), self.velo_x_record)
         plt.plot(range(len(self.velo_y_record)), self.velo_y_record)
         plt.plot(range(len(self.velo_z_record)), self.velo_z_record)
-        plt.plot(range(len(self.vae_velo_x_record)), self.vae_velo_x_record, linestyle='dashed')
-        plt.plot(range(len(self.vae_velo_y_record)), self.vae_velo_y_record, linestyle='dashed')
-        plt.plot(range(len(self.vae_velo_z_record)), self.vae_velo_z_record, linestyle='dashed')
         plt.xlabel("Step")
         plt.ylabel("m/s")
         plt.legend(['vx', 'vy', 'vz', 'vae_vx', 'vae_vy', 'vae_vz'])

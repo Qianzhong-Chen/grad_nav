@@ -1,8 +1,0 @@
-python train_shac.py --cfg ./cfg/shac/turtlebot_nerf.yaml --logdir ./logs/TurtlebotNerf/shac
-
-python train_shac.py --cfg ./cfg/shac/turtlebot.yaml --logdir ./logs/Turtlebot/shac
-
-
-python train_shac.py --cfg ./cfg/shac/turtlebot.yaml --checkpoint /home/david/Disk1/DiffRL_Nerf/examples/logs/Turtlebot/shac/04-28-2024-16-27-55/best_policy.pt --play --render
-
-python train_shac.py --cfg ./cfg/shac/turtlebot_nerf.yaml --checkpoint /home/qianzhong/DiffRL_NeRF/examples/logs/TurtlebotNerf/shac/05-27-2024-02-06-55/best_policy.pt --play --render

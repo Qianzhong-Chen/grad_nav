@@ -5,7 +5,6 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-# seperate VAE net and velocity net
 
 from multiprocessing.sharedctypes import Value
 import sys, os
@@ -22,12 +21,7 @@ import torch
 from torchvision import models, transforms
 import torch.nn as nn
 import math
-
-# from tensorboardX import SummaryWriter
 import yaml
-
-# import dflex as df
-
 import envs
 import models.actor
 import models.critic
@@ -37,26 +31,18 @@ from utils.running_mean_std import RunningMeanStd
 from utils.dataset import CriticDataset
 from utils.time_report import TimeReport
 from utils.average_meter import AverageMeter
-
-from .vae_3 import VAE
-from .velo_net import VELO_NET
-
-import pdb
+from models.vae import VAE
 import wandb
-import datetime
 torch.autograd.set_detect_anomaly(True)
 
 class BatchLowPassFilter:
     def __init__(self, alpha=0.1, batch_size=1):
         self.alpha = alpha
-        self.last_values = None  # Initialize to None; will be set to the first batch
-
+        self.last_values = None  
     def filter(self, new_values):
         if self.last_values is None:
-            # Initialize with the first batch
             self.last_values = new_values.clone().detach()
         else:
-            # Apply the EMA formula to the batch
             self.last_values = self.alpha * new_values + (1 - self.alpha) * self.last_values.clone().detach()
         return self.last_values
 
@@ -66,6 +52,7 @@ class GradNav:
         self.map_name = cfg["params"]["config"].get("map_name", 'gate_mid')
 
         seeding(cfg["params"]["general"]["seed"])
+        env_hyper = cfg["params"].get("env_hyper", None)
         self.env = env_fn(num_envs = cfg["params"]["config"]["num_actors"], \
                             device = cfg["params"]["general"]["device"], \
                             render = cfg["params"]["general"]["render"], \
@@ -74,6 +61,7 @@ class GradNav:
                             stochastic_init = cfg["params"]["diff_env"].get("stochastic_env", True), \
                             MM_caching_frequency = cfg["params"]['diff_env'].get('MM_caching_frequency', 1), \
                             map_name = self.map_name,
+                            env_hyper = env_hyper,
                             no_grad = False)
 
         print('num_envs = ', self.env.num_envs)
@@ -98,13 +86,11 @@ class GradNav:
         self.actor_lr = float(cfg["params"]["config"]["actor_learning_rate"])
         self.critic_lr = float(cfg['params']['config']['critic_learning_rate'])
         self.vae_lr = float(cfg['params']['config'].get('vae_learning_rate', 1e-4))
-        self.vel_net_lr = float(cfg['params']['config'].get('vel_net_learning_rate', 1e-4))
         # lr schedule
         self.lr_schedule = cfg['params']['config'].get('lr_schedule', 'linear')
         self.init_actor_lr = self.actor_lr
         self.init_critic_lr = self.critic_lr
         self.init_vae_lr = self.vae_lr
-        self.init_vel_net_lr = self.vel_net_lr
         # domain_randomization
         self.domain_randomization = cfg['params']['config'].get('domain_randomization', False)
         if self.domain_randomization:
@@ -121,28 +107,11 @@ class GradNav:
         if cfg['params']['config'].get('ret_rms', False):
             self.ret_rms = RunningMeanStd(shape = (), device = self.device)
 
-        self.rew_norm = None
-        if cfg['params']['config'].get('reward_norm', False):
-            self.rew_norm = True
-            rew_momentum = cfg['params']['config'].get('rew_momentum', 0.9)
-            self.rew_mean = 0.0
-            self.rew_var = 1.0
-
-        self.stage_change_time = cfg['params']['config'].get('stage_change_time', 300)
         self.change_gate_count = 0
         self.multi_gate = cfg['params']['config'].get('multi_gate', False)
         self.gate_change_time = cfg['params']['config'].get('gate_change_time', 150)
 
-        self.vel_net_early_stop = cfg['params']['config'].get('vel_net_early_stop', False)
-        self.vel_net_stop_time = cfg['params']['config'].get('vel_net_stop_time', 300)
-
-        # pretrain vel_net
-        self.pretrain_vel_net = cfg['params']['config'].get('pretrain_vel_net', False)
-        self.pretrain_epoch = cfg['params']['config'].get('pretrain_epoch', 30)
-        self.pretrain_steps_num = cfg['params']['config'].get('pretrain_steps_num', 100)
-        
         self.rew_scale = cfg['params']['config'].get('rew_scale', 1.0)
-
         self.critic_iterations = cfg['params']['config'].get('critic_iterations', 16)
         self.num_batch = cfg['params']['config'].get('num_batch', 4)
         self.batch_size = self.num_envs * self.steps_num // self.num_batch
@@ -206,12 +175,13 @@ class GradNav:
         # creat VAE
         self.num_history = self.env.num_history
         self.num_latent = self.env.num_latent
-        self.vae = VAE(self.num_obs, self.num_history, self.num_latent, activation = 'elu', decoder_hidden_dims = [512, 256, 128]).to(self.device)
+        self.kl_weight = cfg["params"]["vae"].get("kl_weight", 1.0)
+        self.vae_encoder_dim = cfg["params"]["vae"].get("encoder_units", [256, 256, 256])
+        self.vae_decoder_dim = cfg["params"]["vae"].get("decoder_units", [32, 64, 128, 256])
+        self.vae = VAE(self.num_obs, self.num_history, self.num_latent, kld_weight=self.kl_weight, activation='elu', decoder_hidden_dims=self.vae_decoder_dim, encoder_hidden_dims=self.vae_encoder_dim).to(self.device)
         self.kl_weight = cfg["params"]["vae"].get("kl_weight", 1.0)
         self.velo_weight = cfg["params"]["vae"].get("velo_weight", 1.0)
-        # create VELO_NET
-        self.vel_net = VELO_NET(self.num_obs, self.num_history, self.num_latent, activation = 'elu', decoder_hidden_dims = [512, 256, 128]).to(self.device)
-    
+        
 
         if cfg['params']['general']['train']:
             self.save('init_policy')
@@ -220,7 +190,6 @@ class GradNav:
         self.actor_optimizer = torch.optim.AdamW(self.actor.parameters(), betas = cfg['params']['config']['betas'], lr = self.actor_lr, weight_decay=5e-3)
         self.critic_optimizer = torch.optim.AdamW(self.critic.parameters(), betas = cfg['params']['config']['betas'], lr = self.critic_lr, weight_decay=5e-3)
         self.vae_optimizer = torch.optim.AdamW(self.vae.parameters(), betas = cfg['params']['config']['betas'], lr = self.vae_lr, weight_decay=1e-2)
-        self.vel_net_optimizer = torch.optim.AdamW(self.vel_net.parameters(), betas = cfg['params']['config']['betas'], lr = self.vel_net_lr, weight_decay=1e-2)
 
         # replay buffer
         self.obs_buf = torch.zeros((self.steps_num, self.num_envs, self.num_obs), dtype = torch.float32, device = self.device)
@@ -261,9 +230,7 @@ class GradNav:
         self.actor_loss = np.inf
         self.value_loss = np.inf
         self.vae_loss = np.inf
-        self.vel_net_loss = np.inf
         self.mean_recons_loss = np.inf
-        self.mean_vel_loss = np.inf
         self.mean_kld_loss = np.inf
         
         # average meter
@@ -279,53 +246,6 @@ class GradNav:
         self.mean_grad = 0
 
        
-    def fast_log(self, action, raw_obs, norma_obs):
-        """Log actions and states to respective files."""
-        # action log
-        with open(self.filename_action, "a") as f_action:
-            f_action.write(f"thrust: {action[0,0]}, roll: {action[0,1]}, pitch: {action[0,2]}, yaw: {action[0,3]}\n")
-        # raw obs log
-        obs_raw_data = raw_obs[0]
-        with open(self.filename_raw_obs, "a") as f_state:
-            f_state.write("\n".join([
-                "=== Observation ===",
-                f"Z-axis: Pos: {obs_raw_data[0]}, Linear Vel: {obs_raw_data[1]}, Pos Ablation: {obs_raw_data[2]}",
-                f"Quaternion: {', '.join(map(str, obs_raw_data[3:7]))}",
-                f"Angular Vel Ablation: {', '.join(map(str, obs_raw_data[7:10]))}",
-                f"Up Vel Ablation: {obs_raw_data[10]}",
-                f"Actions: {', '.join(map(str, obs_raw_data[11:15]))}",
-                f"Prev Actions: {', '.join(map(str, obs_raw_data[15:19]))}",
-                f"Linear Vel: {', '.join(map(str, obs_raw_data[19:22]))}",
-                f"Visual Info: {', '.join(map(str, obs_raw_data[22:46]))}",
-                f"Latent Vector: {', '.join(map(str, obs_raw_data[46:62]))}",
-                "\n"
-            ]))
-        # norm obs log
-        norma_obs = norma_obs[0]
-        with open(self.filename_norm_obs, "a") as f_state:
-            f_state.write("\n".join([
-                "=== Normalized Observation ===",
-                f"Z-axis: Pos: {norma_obs[0]}, Linear Vel: {norma_obs[1]}, Pos Ablation: {norma_obs[2]}",
-                f"Quaternion: {', '.join(map(str, norma_obs[3:7]))}",
-                f"Angular Vel Ablation: {', '.join(map(str, norma_obs[7:10]))}",
-                f"Up Vel Ablation: {norma_obs[10]}",
-                f"Actions: {', '.join(map(str, norma_obs[11:15]))}",
-                f"Prev Actions: {', '.join(map(str, norma_obs[15:19]))}",
-                f"Linear Vel: {', '.join(map(str, norma_obs[19:22]))}",
-                f"Visual Info: {', '.join(map(str, norma_obs[22:46]))}",
-                f"Latent Vector: {', '.join(map(str, norma_obs[46:62]))}",
-                "\n"
-            ]))
-
-    def reward_normalization(self, rewards):
-        # update mean and var for reward normalization
-        batch_mean = torch.mean(rewards)
-        batch_var = torch.var(rewards)
-        self.rew_mean = self.rew_momentum * self.rew_mean + (1 - self.rew_momentum) * batch_mean
-        self.rew_var = self.rew_momentum * self.rew_var + (1 - self.rew_momentum) * batch_var
-        std = torch.sqrt(self.rew_var)
-        normalized_rewards = (rewards - self.rew_mean) / (std + 1e-8)
-        return normalized_rewards
         
     def compute_actor_loss(self, deterministic = False):
         rew_acc = torch.zeros((self.steps_num + 1, self.num_envs), dtype = torch.float32, device = self.device)
@@ -333,11 +253,9 @@ class GradNav:
         next_values = torch.zeros((self.steps_num + 1, self.num_envs), dtype = torch.float32, device = self.device)
         
         actor_loss = torch.tensor(0., dtype = torch.float32, device = self.device)
-        # VAE loss only for recording
+        vae_loss = torch.tensor(0., dtype = torch.float32, device = self.device)
         mean_recons_loss = 0
         mean_kld_loss = 0
-        #VEL_NET loss
-        mean_vel_loss = 0 
 
         with torch.no_grad():
             if self.obs_rms is not None:
@@ -380,26 +298,23 @@ class GradNav:
                 ], dim=1)
                 # Continue with the rest of your pipeline
                 vae_output, _ = self.vae.forward(self.obs_hist_buf)
-                vel_net_output, _ = self.vel_net.forward(self.obs_hist_buf)
-                obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(filtered_actions, vae_output, vel_net_output)
+                obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(filtered_actions, vae_output)
             else:
                 # No LPF
                 actions = self.actor(obs, deterministic = deterministic)
                 vae_output, _ = self.vae.forward(self.obs_hist_buf)
-                vel_net_output, _ = self.vel_net.forward(self.obs_hist_buf)
-                obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(torch.tanh(actions), vae_output, vel_net_output)
+                obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(torch.tanh(actions), vae_output)
 
            
             self.obs_hist_buf = history_obs
 
             # update VAE
             self.time_report.start_timer("VAE training")
-            recons_loss, kld_loss = self.vae_closure(obs, vel_obs, history_obs, done)
-            vel_loss = self.vel_net_closure(obs, vel_obs, history_obs, done)
+            recons_loss, kld_loss, vae_loss_grad = self.compute_vae_loss(obs, vel_obs, history_obs, done)
             self.time_report.end_timer("VAE training")
-            mean_recons_loss += recons_loss
-            mean_vel_loss += vel_loss
-            mean_kld_loss += kld_loss
+            mean_kld_loss = mean_kld_loss + kld_loss
+            mean_recons_loss = mean_recons_loss + recons_loss
+            vae_loss = vae_loss + vae_loss_grad
             
             with torch.no_grad():
                 raw_rew = rew.clone()
@@ -423,19 +338,15 @@ class GradNav:
                     self.ret_rms.update(self.ret)
                 rew = rew / torch.sqrt(ret_var + 1e-6)
 
-            if self.rew_norm is not None:
-                rew = self.reward_normalization(rew)
 
             self.episode_length += 1
-        
             done_env_ids = done.nonzero(as_tuple = False).squeeze(-1)
-
             next_values[i + 1] = self.target_critic(privilege_obs).squeeze(-1)
 
             for id in done_env_ids:
                 if torch.isnan(extra_info['obs_before_reset'][id]).sum() > 0 \
                     or torch.isinf(extra_info['obs_before_reset'][id]).sum() > 0 \
-                    or (torch.abs(extra_info['obs_before_reset'][id]) > 1e6).sum() > 0: # ugly fix for nan values
+                    or (torch.abs(extra_info['obs_before_reset'][id]) > 1e6).sum() > 0: 
                     next_values[i + 1, id] = 0.
                 elif self.episode_length[id] < self.max_episode_length: # early termination
                     next_values[i + 1, id] = 0.
@@ -457,16 +368,9 @@ class GradNav:
             if i < self.steps_num - 1:
                 actor_loss = actor_loss + (- rew_acc[i + 1, done_env_ids] - self.gamma * gamma[done_env_ids] * next_values[i + 1, done_env_ids]).sum()
             else:
-                # terminate all envs at the end of optimization iteration
                 actor_loss = actor_loss + (- rew_acc[i + 1, :] - self.gamma * gamma * next_values[i + 1, :]).sum()
         
-            if torch.isnan(actor_loss):
-                print('nan')
-            
-            # compute gamma for next step
             gamma = gamma * self.gamma
-
-            # clear up gamma and rew_acc for done envs
             gamma[done_env_ids] = 1.
             rew_acc[i + 1, done_env_ids] = 0.
 
@@ -479,7 +383,6 @@ class GradNav:
                     self.done_mask[i, :] = 1.
                 self.next_values[i] = next_values[i + 1].clone()
 
-            # pdb.set_trace()
             # collect episode loss
             with torch.no_grad():
                 self.episode_loss -= raw_rew
@@ -491,8 +394,7 @@ class GradNav:
                     self.episode_length_meter.update(self.episode_length[done_env_ids])                    
                     for done_env_id in done_env_ids:
                         if (self.episode_loss[done_env_id] > 1e6 or self.episode_loss[done_env_id] < -1e6):
-                            print('ep loss error')
-                            # raise ValueError
+                            print('ep loss exploded')
 
                         self.episode_loss_his.append(self.episode_loss[done_env_id].item())
                         self.episode_discounted_loss_his.append(self.episode_discounted_loss[done_env_id].item())
@@ -503,8 +405,8 @@ class GradNav:
                         self.episode_gamma[done_env_id] = 1.
 
         actor_loss /= self.steps_num * self.num_envs
+        vae_loss /= self.steps_num 
         mean_recons_loss /= self.steps_num
-        mean_vel_loss /= self.steps_num
         mean_kld_loss /= self.steps_num
 
         if self.ret_rms is not None:
@@ -512,43 +414,20 @@ class GradNav:
             
         self.actor_loss = actor_loss.detach().cpu().item()
         self.mean_recons_loss = mean_recons_loss
-        self.mean_vel_loss = mean_vel_loss
         self.mean_kld_loss = mean_kld_loss
         self.vae_loss = mean_recons_loss + self.kl_weight * mean_kld_loss
-        self.vel_net_loss = self.mean_vel_loss
-
         self.step_count += self.steps_num * self.num_envs
-
-        if torch.isnan(actor_loss):
-            print('nan')
 
         return actor_loss
     
-    def vae_closure(self, obs, vel_obs, history_obs, done):
-        self.vae_optimizer.zero_grad()
-        vae_loss_dict = self.vae.loss_fn(history_obs.clone().detach(), obs.clone().detach(), vel_obs.clone().detach(), self.kl_weight, self.velo_weight)
+    def compute_vae_loss(self, obs, vel_obs, history_obs, done):
+        vae_loss_dict = self.vae.loss_fn(history_obs.clone().detach(), obs.clone().detach())
         valid = (done == 0).squeeze()
         vae_loss = torch.mean(vae_loss_dict['loss'][valid])
-        vae_loss.backward()
-        nn.utils.clip_grad_norm_(self.vae.parameters(), self.grad_norm)
-        self.vae_optimizer.step()
-        with torch.no_grad():
-            recons_loss = torch.mean(vae_loss_dict['recons_loss'][valid])
-            # vel_loss = torch.mean(vae_loss_dict['vel_loss'][valid])
-            kld_loss = torch.mean(vae_loss_dict['kld_loss'][valid]) 
-        return recons_loss.item(), kld_loss.item()
+        recons_loss = torch.mean(vae_loss_dict['recons_loss'][valid])
+        kld_loss = torch.mean(vae_loss_dict['kld_loss'][valid]) 
+        return recons_loss.item(), kld_loss.item(), vae_loss
     
-    def vel_net_closure(self, obs, vel_obs, history_obs, done):
-        self.vel_net_optimizer.zero_grad()
-        raw_loss = self.vel_net.loss_fn(history_obs.clone().detach(), vel_obs.clone().detach())
-        valid = (done == 0).squeeze()
-        vel_loss = torch.mean(raw_loss[valid])
-        vel_loss.backward()
-        nn.utils.clip_grad_norm_(self.vel_net.parameters(), self.grad_norm)
-        self.vel_net_optimizer.step()
-        with torch.no_grad():
-            velo_loss = torch.mean(raw_loss[valid])
-        return velo_loss.item()
     
     @torch.no_grad()
     def evaluate_policy(self, num_games, deterministic = False):
@@ -559,9 +438,7 @@ class GradNav:
         episode_length = torch.zeros(self.num_envs, dtype = int)
         episode_gamma = torch.ones(self.num_envs, dtype = torch.float32, device = self.device)
         episode_discounted_loss = torch.zeros(self.num_envs, dtype = torch.float32, device = self.device)
-       
         obs = self.env.reset()
-
         games_cnt = 0
 
         while games_cnt < num_games:
@@ -579,25 +456,16 @@ class GradNav:
                 actions[:, 2] = self.eval_y_filter.filter(actions[:, 2])
                 actions[:, 3] = self.eval_thrust_filter.filter(actions[:, 3])
 
-                # log action and observation
-                if self.log_flag:
-                    self.fast_log(np.around(actions.clone().cpu().numpy(),3), np.around(raw_obs.clone().cpu().numpy(),3), np.around(obs.clone().cpu().numpy(),3))
-
-                # Continue with the rest of your pipeline
                 vae_output, _ = self.vae.forward(self.obs_hist_buf)
-                vel_net_output, _ = self.vel_net.forward(self.obs_hist_buf)
-                obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(actions, vae_output, vel_net_output)
+                obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(actions, vae_output)
             else:
                 # No LPF
                 actions = self.actor(obs, deterministic = deterministic)
                 vae_output, _ = self.vae.forward(self.obs_hist_buf)
-                vel_net_output, _ = self.vel_net.forward(self.obs_hist_buf)
-                obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(torch.tanh(actions), vae_output, vel_net_output)
+                obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(torch.tanh(actions), vae_output)
             
             self.obs_hist_buf = history_obs
-
             episode_length += 1
-
             done_env_ids = done.nonzero(as_tuple = False).squeeze(-1)
 
             episode_loss -= rew
@@ -653,27 +521,8 @@ class GradNav:
         mean_policy_loss, mean_policy_discounted_loss, mean_episode_length = self.evaluate_policy(num_games = num_games, deterministic = not self.stochastic_evaluation)
         print_info('mean episode loss = {}, mean discounted loss = {}, mean episode length = {}'.format(mean_policy_loss, mean_policy_discounted_loss, mean_episode_length))
         
-    def pretrain_action(self):
-        rows = self.env.num_envs
-        # Generate values for each column
-        col1 = torch.cat([
-            torch.rand(rows // 2) * 0.3 - 0.85,  # Range: -0.75 to -0.25
-            torch.rand(rows // 2) * 0.3 + 0.35   # Range: 0.25 to 0.75
-        ])
-        col2 = torch.rand(rows) * 0.4 + 0.5  # Range: 0.7 ± 0.2
-        col3 = torch.cat([
-            torch.rand(rows // 2) * 0.15 - 0.15,  # Range: -0.15 to 0
-            torch.rand(rows // 2) * 0.15          # Range: 0 to 0.15
-        ])
-        col4 = torch.full((rows,), 0.327)  # Constant value 0.327
-
-        # Combine into a single tensor and move to the assigned device
-        action = torch.stack([col1, col2, col3, col4], dim=1).to(self.env.device)
-
-        return action
-
+    
     def train(self):
-        self.log_flag = False
         self.start_time = time.time()
 
         # add timers
@@ -692,7 +541,6 @@ class GradNav:
         self.initialize_env()
         self.episode_loss = torch.zeros(self.num_envs, dtype = torch.float32, device = self.device)
         self.episode_discounted_loss = torch.zeros(self.num_envs, dtype = torch.float32, device = self.device)
-        # self.episode_length = torch.zeros(self.num_envs, dtype = int)
         self.episode_length = torch.zeros(self.num_envs, dtype = int, device = self.device)
         self.episode_gamma = torch.ones(self.num_envs, dtype = torch.float32, device = self.device)
         
@@ -725,8 +573,6 @@ class GradNav:
 
             return actor_loss
 
-
-
         # setup wandb
         self.hyper_parameter = self.env.hyper_parameter
         train_parameter = {
@@ -739,46 +585,9 @@ class GradNav:
             }
         self.hyper_parameter.update(train_parameter)
         wandb.init(
-            # set the wandb project where this run will be logged
             project=f'{self.env.agent_name}-{self.map_name}',
-            # track hyperparameters and run metadata
             config=self.hyper_parameter
         )
-
-        
-        # pretrain offline vel_net
-        if self.pretrain_vel_net:
-            print_info('pretraining VEL_NET with large roll')
-            for epoch in range(self.pretrain_epoch):
-                obs, privilege_obs = self.env.initialize_trajectory()
-                
-                mean_vel_loss = 0
-                actions = self.pretrain_action() # steady actions to get large speed
-                for i in range(self.pretrain_steps_num):
-                    # collect data for critic training
-                    with torch.no_grad():
-                        # # TODO: ugly implementation
-                        obs = torch.nan_to_num(obs, nan=0.0, posinf=1e3, neginf=-1e3)
-                        privilege_obs = torch.nan_to_num(privilege_obs, nan=0.0, posinf=1e3, neginf=-1e3)
-
-
-                    # # TODO: bad implementation
-                    # invalid_rows = torch.isnan(actions).any(dim=1) | torch.isinf(actions).any(dim=1)
-                    # actions[invalid_rows] = 0
-                    vae_output, _ = self.vae.forward(self.obs_hist_buf)
-                    vel_net_output, _ = self.vel_net.forward(self.obs_hist_buf)
-                    obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(actions, vae_output, vel_net_output)
-                    self.obs_hist_buf = history_obs
-
-                    # update VEL_NET
-                    vel_loss = self.vel_net_closure(obs, vel_obs, history_obs, done)
-                    mean_vel_loss += vel_loss
-                
-                mean_vel_loss /= self.pretrain_steps_num
-                self.vel_net_loss = mean_vel_loss
-                print('pretrain iter {}, vel_net loss {:.5f}'.format(epoch, self.vel_net_loss))
-
-                    
 
         # main training process
         for epoch in range(self.max_epochs):
@@ -807,13 +616,6 @@ class GradNav:
                 vae_lr = (1e-5 - self.vae_lr) * float(epoch / self.max_epochs) + self.vae_lr
                 for param_group in self.vae_optimizer.param_groups:
                     param_group['lr'] = vae_lr
-                if self.env.training_stage == 0:
-                    vel_net_lr = (1e-5 - self.vel_net_lr) * float(epoch / self.max_epochs) + self.vel_net_lr
-                    if self.vel_net_early_stop and (epoch > self.vel_net_stop_time):
-                        vel_net_lr = 0.0
-                for param_group in self.vel_net_optimizer.param_groups:
-                    param_group['lr'] = vel_net_lr
-
             # learning rate schedule
             elif self.lr_schedule == 'cosine':
                 # Calculate the cosine schedule
@@ -827,15 +629,8 @@ class GradNav:
                 vae_lr = 1e-5 + (self.vae_lr - 1e-5) * 0.5 * (1 + math.cos(math.pi * epoch / self.max_epochs))
                 for param_group in self.vae_optimizer.param_groups:
                     param_group['lr'] = vae_lr
-                if self.env.training_stage == 0:
-                    vel_net_lr = 1e-5 + (self.vel_net_lr - 1e-5) * 0.5 * (1 + math.cos(math.pi * epoch / self.max_epochs))
-                    if self.vel_net_early_stop and (epoch > self.vel_net_stop_time):
-                        vel_net_lr = 0.0
-                for param_group in self.vel_net_optimizer.param_groups:
-                    param_group['lr'] = vel_net_lr
             else:
                 lr = self.actor_lr
-
 
 
             # train actor
@@ -870,7 +665,6 @@ class GradNav:
                         clip_grad_norm_(self.critic.parameters(), self.grad_norm)
 
                     self.critic_optimizer.step()
-
                     total_critic_loss += training_critic_loss
                     batch_cnt += 1
                 
@@ -899,8 +693,8 @@ class GradNav:
                 mean_policy_discounted_loss = np.inf
                 mean_episode_length = 0
 
-            print('iter {}: ep loss {:.2f}, ep discounted loss {:.2f}, vae loss {:.2f}, vel_net loss {:.3f}, ep len {:.1f}, fps total {:.2f}, value loss {:.2f}, grad norm before clip {:.2f}, grad norm after clip {:.2f}'.format(\
-                    self.iter_count, mean_policy_loss, mean_policy_discounted_loss, self.vae_loss, self.vel_net_loss, mean_episode_length, self.steps_num * self.num_envs / (time_end_epoch - time_start_epoch), self.value_loss, self.grad_norm_before_clip, self.grad_norm_after_clip))
+            print('iter {}: ep loss {:.2f}, ep discounted loss {:.2f}, vae loss {:.2f}, ep len {:.1f}, fps total {:.2f}, value loss {:.2f}, grad norm before clip {:.2f}, grad norm after clip {:.2f}'.format(\
+                    self.iter_count, mean_policy_loss, mean_policy_discounted_loss, self.vae_loss, mean_episode_length, self.steps_num * self.num_envs / (time_end_epoch - time_start_epoch), self.value_loss, self.grad_norm_before_clip, self.grad_norm_after_clip))
 
             # self.writer.flush()
         
@@ -920,7 +714,6 @@ class GradNav:
             wandb_record_loss = mean_policy_loss
             wandb.log({"actor loss": wandb_record_loss, 
                        "VAE_loss": self.vae_loss,
-                       "VEL_NET_loss": self.vel_net_loss,
                        "recons_loss": self.mean_recons_loss,
                        "kld_loss": self.mean_kld_loss,
                        "episode_length": mean_episode_length,
@@ -940,30 +733,17 @@ class GradNav:
         
         # evaluate the final policy's performance
         self.run(self.num_envs)
-
-        # self.close()
     
-    ## Load and Save after 01/08
     def play(self, cfg):
         ckpt_path = cfg['params']['general']['checkpoint']
         ckpt_dir = os.path.dirname(ckpt_path)
         self.load(cfg['params']['general']['checkpoint'])
-         # log system
-        self.log_flag = True 
-        # timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self.log_dir = os.path.join(self.env.save_path, "fast_log")
-        os.makedirs(self.log_dir, exist_ok=True)
-
-        self.filename_action = os.path.join(self.log_dir, "fast_action_record.txt")
-        self.filename_raw_obs = os.path.join(self.log_dir, "fast_raw_obs_record.txt")
-        self.filename_norm_obs = os.path.join(self.log_dir, "fast_normalized_obs_record.txt")
-
         self.run(cfg['params']['config']['player']['games_num'])
 
     def save(self, filename = None):
         if filename is None:
             filename = 'best_policy'
-        torch.save([self.actor, self.critic, self.target_critic, self.obs_rms, self.vae, self.vel_net, self.env.visual_net], os.path.join(self.log_dir, "{}.pt".format(filename)))
+        torch.save([self.actor, self.critic, self.target_critic, self.obs_rms, self.vae, self.env.visual_net], os.path.join(self.log_dir, "{}.pt".format(filename)))
     
     def load(self, path):
         print(path)
@@ -973,8 +753,7 @@ class GradNav:
         self.target_critic = checkpoint[2].to(self.device)
         self.obs_rms = checkpoint[3].to(self.device)
         self.vae = checkpoint[4].to(self.device)
-        self.vel_net = checkpoint[5].to(self.device)
-        self.env.visual_net = checkpoint[6].to(self.device)
+        self.env.visual_net = checkpoint[5].to(self.device)
         print_info(f"all nets have been loaded")
 
     

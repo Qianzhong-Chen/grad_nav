@@ -26,17 +26,11 @@ from envs.assets.quadrotor_dynamics_advanced import QuadrotorSimulator
 import numpy as np
 np.set_printoptions(precision=5, linewidth=256, suppress=True)
 
-# try:
-#     from pxr import Usd
-# except ModuleNotFoundError:
-#     print("No pxr package")
-
-# from utils import load_utils as lu
 from utils import torch_utils as tu
 from utils.common import *
 from utils.gs_local import GS, get_gs
-from utils.rotation import dynamic_to_nerf_quaternion_batch, pose_transfer_ns, pose_transfer_ns_batched, quaternion_to_euler, quaternion_yaw_forward
-from utils.model_util import quat_from_axis_angle, transform, quat_from_axis_angle_batch
+from utils.rotation import quaternion_to_euler, quaternion_yaw_forward
+from utils.model_util import quat_from_axis_angle
 from utils.model import ModelBuilder
 from utils.point_cloud_util import ObstacleDistanceCalculator
 from utils.traj_planner_global import TrajectoryPlanner
