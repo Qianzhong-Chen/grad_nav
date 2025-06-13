@@ -1,25 +1,31 @@
-# GRaD-Nav
-
-This repository contains the implementation for the paper [GRaD-Nav: Learning Visual Drone Navigation with Gaussian Radiance Fields and Differentiable Dynamics](https://qianzhong-chen.github.io/gradnav.github.io/).
-
-<!-- 
-
-In this paper, we present a GPU-based differentiable simulation and propose a policy learning method named SHAC leveraging the developed differentiable simulation. We provide a comprehensive benchmark set for policy learning with differentiable simulation. The benchmark set contains six robotic control problems for now as shown in the figure below. 
-
-<p align="center">
-    <img src="figures/envs.png" alt="envs" width="800" />
-</p> -->
-
-## Installation
-
-- `git clone git@github.com:Qianzhong-Chen/GRaD_Nav_internal.git`
+# GRaD-Nav: Learning Visual Drone Navigation with Gaussian Radiance Fields and Differentiable Dynamics
 
 
-#### Prerequisites
 
-- Configure [nerfstudio](https://github.com/nerfstudio-project/nerfstudio), by default, using nerfstudio conda env for future development.
+<div align="center">
 
-- Confirm all 3DGS packages have been installed
+[Project Page](https://qianzhong-chen.github.io/gradnav.github.io/) | [Video](https://www.youtube.com/watch?v=ySCSm8eJLyY&t=3s) | [Arxiv](https://arxiv.org/abs/2503.03984)
+
+</div>
+
+<div align="center">
+  <img src="envs/assets/grad_nav_project.jpg" style="width:80%" />
+</div>
+
+---
+
+## Configurations
+
+- Clone the repository:
+  ```
+  git clone git@github.com:Qianzhong-Chen/GRaD_Nav_internal.git
+  ```
+
+
+#### Set up conda environment and install dependencies.
+
+- Install and configure [nerfstudio](https://github.com/nerfstudio-project/nerfstudio), start nerfstudio conda env
+
   ```
   conda activate nerfstudio
   pip install gsplat
@@ -32,43 +38,62 @@ In this paper, we present a GPU-based differentiable simulation and propose a po
 
 ## Data Download and Setup
 
-1. **Download Required Data:**
-   - [3DGS Data](https://drive.google.com/drive/folders/1nx2JLNtK6uSJuDX8HUS75eTrn6gfR0jG?usp=sharing)
-   - [Point Cloud Data](https://drive.google.com/drive/folders/1ZdvTSQBcCL8WTKPaocCjHBj_vTPpjfjS?usp=sharing)
+- Download the required [data](https://drive.google.com/drive/folders/1XEoJU3PVTMx782MMfSFNm5D0zTawKrbJ?usp=sharing).
+   ```
+   cd grad_nav/envs/assets
+   gdown --id 1xIDb1-HFkniBagvMbWDgfy4okKTckwra # point cloud data
+   unzip point_cloud.zip
+   gdown --id 1skbXqg__Ew3ytNmqe_xiaqHpexZnsfdw # 3DGS data
+   unzip gs_data.zip
+   cd ../../
+   ```
 
-2. **Place the downloaded folders in:**
-  <GRaD_Nav_internal/envs/assets/>
-
-
-
-3. **Update Configuration:**
-- Modify lines **4-14** in:
-  ```
-  GRaD_Nav_internal/envs/assets/gs_data/<map_name>/splatfacto/<time>/config.yml
-  ```
-- Set the corresponding paths to your **3DGS data folder** manually.
-
-## Create a new branch and check out
-
-```
-git branch <branch_name>
-git checkout <branch_name>
-```
 
 ## Training
-- Checkout <.github/launch.json>, it is highly recommended to use VSCode debugger
-- Set up [wandb](https://docs.wandb.ai/quickstart/) (highly recommended) or comment out related code
+
+### 1. GRaD-Nav:
+- GRaD-Nav long trajectory training:
+  ```
+  python examples/train_gradnav.py --cfg examples/cfg/gradnav/drone_long_traj.yaml --logdir examples/logs/DroneLongTraj/gradnav
+  ```
+- GRaD-Nav multi-gate training:
+  ```
+  python examples/train_gradnav.py --cfg examples/cfg/gradnav/drone_multi_gate.yaml --logdir examples/logs/DroneMultiGate/gradnav
+  ```
+### 2. Baselines
+- PPO long trajectory training:
+  ```
+  python examples/train_ppo.py --cfg examples/cfg/ppo/drone_ppo.yaml --logdir examples/logs/DronePPO/ppo
+  ```
+- BPTT long trajectory training:
+  ```
+  python examples/train_bptt.py --cfg examples/cfg/bptt/drone_long_traj.yaml --logdir examples/logs/DroneLongTraj/bptt
+  ```
+- Using [wandb](https://docs.wandb.ai/quickstart/)  
+  remove `os.environ["WANDB_MODE"] = "disabled"` from `algorithms/<algorithm_name>.py`
 
 
 ## Testing
-Same as above.
-
-## Usage guidance
-- Three parts are the most important: 
-  - configuration file: <examples/cfg/algo_name/env_name.yaml>, control the hyper-parameter for training as well as 3D GS map choice
-  - environment file: <envs/env_name.py>, control the agent-external_env interaction, including forward simulation, obs formation, reward caculation etc. Each env file is a different task.
-  - algorithm file: <algorithms/algo_name.py> based on the data from env file, train the neural networks.
-
+### 1. GRaD-Nav:
+- GRaD-Nav long trajectory training:
+  ```
+  python examples/train_gradnav.py --cfg examples/cfg/gradnav/drone_long_traj.yaml --checkpoint examples/logs/DroneLongTraj/gradnav/<map_name>/<time_stamp>/best_policy.pt --play --render
+  ```
+- GRaD-Nav multi-gate training:
+  ```
+  python examples/train_gradnav.py --cfg examples/cfg/gradnav/drone_multi_gate.yaml --checkpoint examples/logs/DroneMultiGate/gradnav/<map_name>/<time_stamp>/best_policy.pt --play --render
+  ```
+### 2. Baselines
+- PPO long trajectory training:
+  ```
+  python examples/train_ppo.py --cfg examples/cfg/ppo/drone_ppo.yaml --checkpoint examples/logs/DronePPO/ppo/<map_name>/<time_stamp>/best_policy.pt --play --render
+  ```
+- BPTT long trajectory training:
+  ```
+  python examples/train_bptt.py --cfg examples/cfg/bptt/drone_long_traj.yaml --checkpoint examples/logs/DroneLongTraj/bptt/<map_name>/<time_stamp>/best_policy.pt --play --render
+  ```
+### 3. Test results
+- Simulation results can be found at `examples/outputs/<env_name>/<map_name>/<time_stamp>/`
 
 ## Citation
 

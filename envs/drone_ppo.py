@@ -828,34 +828,20 @@ class DronePPOEnv(DFlexEnv):
 
     def save_recordings(self):
         save_path = self.save_path
-        np.save(f'{save_path}/x.npy', np.array(self.x_record, dtype=object), allow_pickle=True)
-        np.save(f'{save_path}/y.npy', np.array(self.y_record, dtype=object), allow_pickle=True)
-        np.save(f'{save_path}/z.npy', np.array(self.z_record, dtype=object), allow_pickle=True)
-
-        # # figure z over time
+       
+        # figure z over time
         plt.figure()
         plt.plot(range(len(self.z_record)), self.z_record)
         plt.xlabel("Step")
         plt.ylabel("Z/m")
         plt.savefig(f'{save_path}/z_plot.png')
 
-        # figure pose over time
-        plt.figure()
-        plt.plot(range(len(self.x_record)), self.x_record)
-        plt.plot(range(len(self.y_record)), self.y_record)
-        plt.plot(range(len(self.z_record)), self.z_record)
-        plt.xlabel("Step")
-        plt.ylabel("m")
-        plt.legend(['x', 'y', 'z'])
-        plt.savefig(f'{save_path}/pos_plot.png')
-
         # figure traj 
         wp_np = self.reward_wp.clone().detach().cpu().numpy()
         target = self.target[0,:].clone().detach().cpu().numpy()
         plt.figure()
         plt.plot(self.x_record, self.y_record)
-
-        # draw waypoints
+        # waypoints
         wp_num, _ = wp_np.shape
         if wp_num > 0:
             for i in range(wp_num-1):

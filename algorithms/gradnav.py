@@ -1,6 +1,6 @@
 import sys, os
+os.environ["WANDB_MODE"] = "disabled"
 from torch.nn.utils.clip_grad import clip_grad_norm_
-
 project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(project_dir)
 
@@ -28,7 +28,7 @@ torch.autograd.set_detect_anomaly(True)
 class BatchLowPassFilter:
     def __init__(self, alpha=0.1, batch_size=1):
         self.alpha = alpha
-        self.last_values = None  
+        self.last_values = None
     def filter(self, new_values):
         if self.last_values is None:
             self.last_values = new_values.clone().detach()
@@ -142,7 +142,6 @@ class GradNav:
                     del save_cfg['params']['general'][key]
 
             yaml.dump(save_cfg, open(os.path.join(self.log_dir, 'cfg.yaml'), 'w'))
-            # self.writer = SummaryWriter(os.path.join(self.log_dir, 'log'))
             # save interval
             self.save_interval = cfg["params"]["config"].get("save_interval", 500)
             # stochastic inference
@@ -232,7 +231,6 @@ class GradNav:
         self.max_grad = 0
         self.mean_grad = 0
 
-
         
     def compute_actor_loss(self, deterministic = False):
         rew_acc = torch.zeros((self.steps_num + 1, self.num_envs), dtype = torch.float32, device = self.device)
@@ -248,7 +246,7 @@ class GradNav:
             if self.obs_rms is not None:
                 obs_rms = copy.deepcopy(self.obs_rms)
                 privilege_obs_rms = copy.deepcopy(self.privilege_obs_rms)
-                
+            
             if self.ret_rms is not None:
                 ret_var = self.ret_rms.var.clone()
 
@@ -292,7 +290,6 @@ class GradNav:
                 vae_output, _ = self.vae.forward(self.obs_hist_buf)
                 obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(torch.tanh(actions), vae_output)
 
-           
             self.obs_hist_buf = history_obs
 
             # update VAE
@@ -376,7 +373,7 @@ class GradNav:
                 if len(done_env_ids) > 0:
                     self.episode_loss_meter.update(self.episode_loss[done_env_ids])
                     self.episode_discounted_loss_meter.update(self.episode_discounted_loss[done_env_ids])
-                    self.episode_length_meter.update(self.episode_length[done_env_ids])                    
+                    self.episode_length_meter.update(self.episode_length[done_env_ids])
                     for done_env_id in done_env_ids:
                         if (self.episode_loss[done_env_id] > 1e6 or self.episode_loss[done_env_id] < -1e6):
                             print('ep loss exploded')
@@ -402,6 +399,7 @@ class GradNav:
         self.mean_kld_loss = mean_kld_loss
         self.vae_loss = mean_recons_loss + self.kl_weight * mean_kld_loss
         self.step_count += self.steps_num * self.num_envs
+
 
         return actor_loss, vae_loss
     
@@ -440,7 +438,7 @@ class GradNav:
             raw_obs = obs.clone()
             if self.obs_rms is not None:
                 obs = self.obs_rms.normalize(obs)
-            
+
             if self.eval_LPF:
                 # Add LPF
                 actions = self.actor(obs, deterministic=deterministic)
@@ -450,7 +448,6 @@ class GradNav:
                 actions[:, 1] = self.eval_p_filter.filter(actions[:, 1])
                 actions[:, 2] = self.eval_y_filter.filter(actions[:, 2])
                 actions[:, 3] = self.eval_thrust_filter.filter(actions[:, 3])
-
                 vae_output, _ = self.vae.forward(self.obs_hist_buf)
                 obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(actions, vae_output)
             else:
@@ -515,8 +512,8 @@ class GradNav:
     def run(self, num_games):
         mean_policy_loss, mean_policy_discounted_loss, mean_episode_length = self.evaluate_policy(num_games = num_games, deterministic = not self.stochastic_evaluation)
         print_info('mean episode loss = {}, mean discounted loss = {}, mean episode length = {}'.format(mean_policy_loss, mean_policy_discounted_loss, mean_episode_length))
-        
-    
+
+
     def train(self):
         self.start_time = time.time()
 

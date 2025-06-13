@@ -33,6 +33,7 @@ nerf_install/nerfstudio.egg-info/
 *.mp4
 *.ninja
 *.obj
+*.zip
 
 /wandb
 

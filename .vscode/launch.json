@@ -10,8 +10,6 @@
             "args": [
                 "--cfg", "examples/cfg/gradnav/drone_long_traj.yaml",
                 "--logdir", "examples/logs/DroneLongTraj/gradnav",
-                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/gate_mid/01-10-2025-10-26-34/best_policy.pt",
-                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/clutter/01-12-2025-12-35-52/best_policy.pt",
             ],
             "console": "integratedTerminal"
         },
@@ -38,8 +36,6 @@
             "args": [
                 "--cfg", "examples/cfg/gradnav/drone_multi_gate.yaml",
                 "--logdir", "examples/logs/DroneMultiGate/gradnav",
-                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/gate_mid/01-10-2025-10-26-34/best_policy.pt",
-                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/clutter/01-12-2025-12-35-52/best_policy.pt",
             ],
             "console": "integratedTerminal"
         },
@@ -57,8 +53,6 @@
             "console": "integratedTerminal"
         },
 
-
-
         // baseline training with PPO
         {
             "name": "Train PPO long traj",
@@ -68,7 +62,6 @@
             "args": [
                 "--cfg", "examples/cfg/ppo/drone_ppo.yaml",
                 "--logdir", "examples/logs/DronePPO/ppo",
-                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal7/shac/12-29-2024-23-43-38/best_policy.pt",
             ],
             "console": "integratedTerminal"
         },
@@ -79,7 +72,7 @@
             "program": "${workspaceFolder}/examples/train_ppo.py",
             "args": [
                 "--cfg", "examples/cfg/ppo/drone_ppo.yaml",
-                "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/ppo/gate_mid/12-30-2024-12-18-23_SOTA/best_policy.pt",
+                "--checkpoint", "examples/logs/DronePPO/ppo/gate_mid/12-30-2024-12-18-23_SOTA/best_policy.pt",
                 "--play",
                 "--render"
             ],
@@ -93,9 +86,7 @@
             "program": "${workspaceFolder}/examples/train_bptt.py",
             "args": [
                 "--cfg", "examples/cfg/bptt/drone_long_traj.yaml",
-                "--logdir", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/bptt",
-                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/gate_mid/01-10-2025-10-26-34/best_policy.pt",
-                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/clutter/01-12-2025-12-35-52/best_policy.pt",
+                "--logdir", "examples/logs/DroneLongTraj/bptt",
             ],
             "console": "integratedTerminal"
         },
@@ -106,9 +97,7 @@
             "program": "${workspaceFolder}/examples/train_bptt.py",
             "args": [
                 "--cfg", "examples/cfg/bptt/drone_long_traj.yaml", 
-                
-                // "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/shac/gate_mid/01-22-2025-01-26-37_20n/policy_iter400_reward4150.464.pt",
-                "--checkpoint", "examples/logs/QuadrotorGSMaskPosTrajGlobal8/bptt/gate_mid/03-01-2025-22-59-24_paper_video/quadrotor_gs_traj_global_8policy_iter80_reward1345.428.pt",
+                "--checkpoint", "examples/logs/DroneLongTraj/bptt/gate_mid/03-01-2025-22-59-24/best_policy.pt",
                 "--play",
                 "--render"
             ],

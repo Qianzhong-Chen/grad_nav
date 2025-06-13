@@ -6,7 +6,7 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 import sys, os
-
+os.environ["WANDB_MODE"] = "disabled"
 from torch.nn.utils.clip_grad import clip_grad_norm_
 
 project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -20,34 +20,25 @@ from torchvision import models, transforms
 import torch.nn as nn
 import math
 import yaml
-
-
 import envs
 import models.actor
-from optim.gd import GD
 from utils.common import *
 import utils.torch_utils as tu
 from utils.time_report import TimeReport
 from utils.average_meter import AverageMeter
 from utils.running_mean_std import RunningMeanStd
-from ..models.vae import VAE
-from .velo_net import VELO_NET
-
-import pdb
+from models.vae import VAE
 import wandb
 torch.autograd.set_detect_anomaly(True)
 
 class BatchLowPassFilter:
     def __init__(self, alpha=0.1, batch_size=1):
         self.alpha = alpha
-        self.last_values = None  # Initialize to None; will be set to the first batch
-
+        self.last_values = None
     def filter(self, new_values):
         if self.last_values is None:
-            # Initialize with the first batch
             self.last_values = new_values.clone().detach()
         else:
-            # Apply the EMA formula to the batch
             self.last_values = self.alpha * new_values + (1 - self.alpha) * self.last_values.clone().detach()
         return self.last_values
 
@@ -57,6 +48,7 @@ class BPTT:
         self.map_name = cfg["params"]["config"].get("map_name", 'gate_mid')
 
         seeding(cfg["params"]["general"]["seed"])
+        env_hyper = cfg["params"].get("env_hyper", None)
         self.env = env_fn(num_envs = cfg["params"]["config"]["num_actors"], \
                             device = cfg["params"]["general"]["device"], \
                             render = cfg["params"]["general"]["render"], \
@@ -65,6 +57,7 @@ class BPTT:
                             stochastic_init = cfg["params"]["diff_env"].get("stochastic_env", True), \
                             MM_caching_frequency = cfg["params"]['diff_env'].get('MM_caching_frequency', 1), \
                             map_name = self.map_name,
+                            env_hyper = env_hyper,
                             no_grad = False)
 
         print('num_envs = ', self.env.num_envs)
@@ -85,20 +78,17 @@ class BPTT:
         self.actor_lr = float(cfg["params"]["config"]["actor_learning_rate"])
         self.critic_lr = float(cfg['params']['config']['critic_learning_rate'])
         self.vae_lr = float(cfg['params']['config'].get('vae_learning_rate', 1e-4))
-        self.vel_net_lr = float(cfg['params']['config'].get('vel_net_learning_rate', 1e-4))
         # lr schedule
         self.lr_schedule = cfg['params']['config'].get('lr_schedule', 'linear')
         self.init_actor_lr = self.actor_lr
         self.init_critic_lr = self.critic_lr
         self.init_vae_lr = self.vae_lr
-        self.init_vel_net_lr = self.vel_net_lr
         # domain_randomization
         self.domain_randomization = cfg['params']['config'].get('domain_randomization', False)
         if self.domain_randomization:
             self.env.domain_randomization = True
         
         self.target_critic_alpha = cfg['params']['config'].get('target_critic_alpha', 0.4)
-        self.curriculum = cfg['params']['config'].get('curriculum', False)
         self.obs_rms = None
         if cfg['params']['config'].get('obs_rms', False):
             self.obs_rms = RunningMeanStd(shape = (self.num_obs), device = self.device)
@@ -108,29 +98,11 @@ class BPTT:
         if cfg['params']['config'].get('ret_rms', False):
             self.ret_rms = RunningMeanStd(shape = (), device = self.device)
 
-        self.rew_norm = None
-        if cfg['params']['config'].get('reward_norm', False):
-            self.rew_norm = True
-            rew_momentum = cfg['params']['config'].get('rew_momentum', 0.9)
-            self.rew_mean = 0.0
-            self.rew_var = 1.0
-
-        self.multi_stage = cfg['params']['config'].get('multi_stage', False)
-        self.stage_change_time = cfg['params']['config'].get('stage_change_time', 300)
         self.change_gate_count = 0
         self.multi_gate = cfg['params']['config'].get('multi_gate', False)
         self.gate_change_time = cfg['params']['config'].get('gate_change_time', 150)
 
-        self.vel_net_early_stop = cfg['params']['config'].get('vel_net_early_stop', False)
-        self.vel_net_stop_time = cfg['params']['config'].get('vel_net_stop_time', 300)
-
-        # pretrain vel_net
-        self.pretrain_vel_net = cfg['params']['config'].get('pretrain_vel_net', False)
-        self.pretrain_epoch = cfg['params']['config'].get('pretrain_epoch', 30)
-        self.pretrain_steps_num = cfg['params']['config'].get('pretrain_steps_num', 100)
-        
         self.rew_scale = cfg['params']['config'].get('rew_scale', 1.0)
-
         self.name = cfg['params']['config'].get('name', "Ant")
 
         self.truncate_grad = cfg["params"]["config"]["truncate_grads"]
@@ -178,28 +150,24 @@ class BPTT:
             self.steps_num = self.env.episode_length
 
         # create actor critic network
-        self.algo = cfg["params"]["algo"]['name'] # choices: ['gd', 'adam', 'SGD']
-
         self.actor_name = cfg["params"]["network"].get("actor", 'ActorStochasticMLP') # choices: ['ActorDeterministicMLP', 'ActorStochasticMLP']
         actor_fn = getattr(models.actor, self.actor_name)
         self.actor = actor_fn(self.num_obs, self.num_actions, cfg['params']['network'], device = self.device)
         # creat VAE
         self.num_history = self.env.num_history
         self.num_latent = self.env.num_latent
-        self.vae = VAE(self.num_obs, self.num_history, self.num_latent, activation = 'elu', decoder_hidden_dims = [512, 256, 128]).to(self.device)
         self.kl_weight = cfg["params"]["vae"].get("kl_weight", 1.0)
-        self.velo_weight = cfg["params"]["vae"].get("velo_weight", 1.0)
-        # create VELO_NET
-        self.vel_net = VELO_NET(self.num_obs, self.num_history, self.num_latent, activation = 'elu', decoder_hidden_dims = [512, 256, 128]).to(self.device)
-    
+        self.vae_encoder_dim = cfg["params"]["vae"].get("encoder_units", [256, 256, 256])
+        self.vae_decoder_dim = cfg["params"]["vae"].get("decoder_units", [32, 64, 128, 256])
+        self.vae = VAE(self.num_obs, self.num_history, self.num_latent, kld_weight=self.kl_weight, activation='elu', decoder_hidden_dims=self.vae_decoder_dim, encoder_hidden_dims=self.vae_encoder_dim).to(self.device)
+
 
         if cfg['params']['general']['train']:
             self.save('init_policy')
 
         # initialize optimizer
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), betas = cfg['params']['config']['betas'], lr = self.actor_lr, weight_decay=5e-3)
+        self.actor_optimizer = torch.optim.AdamW(self.actor.parameters(), betas = cfg['params']['config']['betas'], lr = self.actor_lr, weight_decay=5e-3)
         self.vae_optimizer = torch.optim.AdamW(self.vae.parameters(), betas = cfg['params']['config']['betas'], lr = self.vae_lr, weight_decay=1e-2)
-        self.vel_net_optimizer = torch.optim.AdamW(self.vel_net.parameters(), betas = cfg['params']['config']['betas'], lr = self.vel_net_lr, weight_decay=1e-2)
 
         # replay buffer
         self.obs_buf = torch.zeros((self.steps_num, self.num_envs, self.num_obs), dtype = torch.float32, device = self.device)
@@ -217,12 +185,7 @@ class BPTT:
             ckpt_dir = os.path.dirname(ckpt_path)
             self.load(cfg['params']['general']['checkpoint'])
             print_info(f'actor critic networks recovered from {ckpt_path}')
-            # if os.path.exists(os.path.join(ckpt_dir, 'visual_net.pth')):
-            #     self.load_visual_net(os.path.join(ckpt_dir, 'visual_net.pth'))
-            #     self.load_vae(os.path.join(ckpt_dir, 'best_vae.pth'))
-            #     self.load_vel_net(os.path.join(ckpt_dir, 'best_vel_net.pth'))
-            #     print_info(f'viusal net loaded')
-        
+
         # for kl divergence computing
         self.old_mus = torch.zeros((self.steps_num, self.num_envs, self.num_actions), dtype = torch.float32, device = self.device)
         self.old_sigmas = torch.zeros((self.steps_num, self.num_envs, self.num_actions), dtype = torch.float32, device = self.device)
@@ -245,9 +208,7 @@ class BPTT:
         self.actor_loss = np.inf
         self.value_loss = np.inf
         self.vae_loss = np.inf
-        self.vel_net_loss = np.inf
         self.mean_recons_loss = np.inf
-        self.mean_vel_loss = np.inf
         self.mean_kld_loss = np.inf
         
         # average meter
@@ -261,23 +222,26 @@ class BPTT:
         # grad recore
         self.max_grad = 0
         self.mean_grad = 0
-        
+
+
     def compute_actor_loss(self, deterministic = False):
         rew_acc = torch.zeros((self.steps_num + 1, self.num_envs), dtype = torch.float32, device = self.device)
         gamma = torch.ones(self.num_envs, dtype = torch.float32, device = self.device)
         
         actor_loss = torch.tensor(0., dtype = torch.float32, device = self.device)
-        # VAE loss only for recording
+        vae_loss = torch.tensor(0., dtype = torch.float32, device = self.device)
         mean_recons_loss = 0
         mean_kld_loss = 0
-        #VEL_NET loss
-        mean_vel_loss = 0 
 
         with torch.no_grad():
             if self.obs_rms is not None:
                 obs_rms = copy.deepcopy(self.obs_rms)
                 privilege_obs_rms = copy.deepcopy(self.privilege_obs_rms)
+            
+            if self.ret_rms is not None:
+                ret_var = self.ret_rms.var.clone()
 
+        # initialize trajectory to cut off gradients between episodes.
         obs, privilege_obs = self.env.initialize_trajectory()
         if self.obs_rms is not None:
             # update obs rms
@@ -310,29 +274,20 @@ class BPTT:
                 ], dim=1)
                 # Continue with the rest of your pipeline
                 vae_output, _ = self.vae.forward(self.obs_hist_buf)
-                vel_net_output, _ = self.vel_net.forward(self.obs_hist_buf)
-                obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(filtered_actions, vae_output, vel_net_output)
+                obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(filtered_actions, vae_output)
             else:
                 # No LPF
                 actions = self.actor(obs, deterministic = deterministic)
                 vae_output, _ = self.vae.forward(self.obs_hist_buf)
-                vel_net_output, _ = self.vel_net.forward(self.obs_hist_buf)
-                obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(torch.tanh(actions), vae_output, vel_net_output)
+                obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(torch.tanh(actions), vae_output)
 
-            # Archive
-            # actions = self.actor(obs, deterministic = deterministic)
-            # obs, rew, done, extra_info = self.env.step(torch.tanh(actions))
-            
             self.obs_hist_buf = history_obs
 
             # update VAE
-            self.time_report.start_timer("VAE training")
-            recons_loss, kld_loss = self.vae_closure(obs, vel_obs, history_obs, done)
-            vel_loss = self.vel_net_closure(obs, vel_obs, history_obs, done)
-            self.time_report.end_timer("VAE training")
-            mean_recons_loss += recons_loss
-            mean_vel_loss += vel_loss
-            mean_kld_loss += kld_loss
+            recons_loss, kld_loss, vae_loss_grad = self.compute_vae_loss(obs, vel_obs, history_obs, done)
+            mean_kld_loss = mean_kld_loss + kld_loss
+            mean_recons_loss = mean_recons_loss + recons_loss
+            vae_loss = vae_loss + vae_loss_grad
             
             with torch.no_grad():
                 raw_rew = rew.clone()
@@ -344,21 +299,19 @@ class BPTT:
                 # update obs rms
                 with torch.no_grad():
                     self.obs_rms.update(obs)
+                    self.privilege_obs_rms.update(privilege_obs)
                 # normalize the current obs
                 obs = obs_rms.normalize(obs)
-                self.privilege_obs_rms.update(privilege_obs)
+                privilege_obs = privilege_obs_rms.normalize(privilege_obs)
 
             self.episode_length += 1
-
             done_env_ids = done.nonzero(as_tuple = False).squeeze(-1)
 
-            # JIE
             rew_acc[i + 1, :] = rew_acc[i, :] + gamma * rew
 
             if i < self.steps_num - 1:
                 actor_loss = actor_loss + (- rew_acc[i + 1, done_env_ids]).sum()
             else:
-                # terminate all envs at the end of optimization iteration
                 actor_loss = actor_loss + (- rew_acc[i + 1, :]).sum()
         
             # compute gamma for next step
@@ -379,9 +332,8 @@ class BPTT:
                     self.episode_length_meter.update(self.episode_length[done_env_ids])
                     for done_env_id in done_env_ids:
                         if (self.episode_loss[done_env_id] > 1e6 or self.episode_loss[done_env_id] < -1e6):
-                            print('ep loss error')
-                            import IPython
-                            IPython.embed()
+                            print('ep loss exploded')
+
                         self.episode_loss_his.append(self.episode_loss[done_env_id].item())
                         self.episode_discounted_loss_his.append(self.episode_discounted_loss[done_env_id].item())
                         self.episode_length_his.append(self.episode_length[done_env_id].item())
@@ -391,50 +343,41 @@ class BPTT:
                         self.episode_gamma[done_env_id] = 1.
 
         actor_loss /= self.steps_num * self.num_envs
+        vae_loss /= self.steps_num 
         mean_recons_loss /= self.steps_num
-        mean_vel_loss /= self.steps_num
         mean_kld_loss /= self.steps_num
-            
+
+        if self.ret_rms is not None:
+            actor_loss = actor_loss * torch.sqrt(ret_var + 1e-6)
         self.actor_loss = actor_loss.detach().cpu().item()
         self.mean_recons_loss = mean_recons_loss
-        self.mean_vel_loss = mean_vel_loss
         self.mean_kld_loss = mean_kld_loss
         self.vae_loss = mean_recons_loss + self.kl_weight * mean_kld_loss
-        self.vel_net_loss = self.mean_vel_loss
-
         self.step_count += self.steps_num * self.num_envs
 
-        if torch.isnan(actor_loss):
-            print('nan')
 
-        return actor_loss
+        return actor_loss, vae_loss
     
-    def vae_closure(self, obs, vel_obs, history_obs, done):
+    def vae_update(self, vae_loss):
+        self.time_report.start_timer("VAE training")
         self.vae_optimizer.zero_grad()
-        vae_loss_dict = self.vae.loss_fn(history_obs.clone().detach(), obs.clone().detach(), vel_obs.clone().detach(), self.kl_weight, self.velo_weight)
-        valid = (done == 0).squeeze()
-        vae_loss = torch.mean(vae_loss_dict['loss'][valid])
         vae_loss.backward()
         nn.utils.clip_grad_norm_(self.vae.parameters(), self.grad_norm)
         self.vae_optimizer.step()
-        with torch.no_grad():
-            recons_loss = torch.mean(vae_loss_dict['recons_loss'][valid])
-            # vel_loss = torch.mean(vae_loss_dict['vel_loss'][valid])
-            kld_loss = torch.mean(vae_loss_dict['kld_loss'][valid]) 
-        return recons_loss.item(), kld_loss.item()
-    
-    def vel_net_closure(self, obs, vel_obs, history_obs, done):
-        self.vel_net_optimizer.zero_grad()
-        raw_loss = self.vel_net.loss_fn(history_obs.clone().detach(), vel_obs.clone().detach())
+        self.time_report.end_timer("VAE training")
+
+    def compute_vae_loss(self, obs, vel_obs, history_obs, done):
+        self.time_report.start_timer("VAE training")
+        vae_loss_dict = self.vae.loss_fn(history_obs.clone().detach(), obs.clone().detach())
         valid = (done == 0).squeeze()
-        vel_loss = torch.mean(raw_loss[valid])
-        vel_loss.backward()
-        nn.utils.clip_grad_norm_(self.vel_net.parameters(), self.grad_norm)
-        self.vel_net_optimizer.step()
-        with torch.no_grad():
-            velo_loss = torch.mean(raw_loss[valid])
-        return velo_loss.item()
+        vae_loss = torch.mean(vae_loss_dict['loss'][valid])
+        recons_loss = torch.mean(vae_loss_dict['recons_loss'][valid])
+        kld_loss = torch.mean(vae_loss_dict['kld_loss'][valid]) 
+        self.time_report.end_timer("VAE training")
+        return recons_loss.item(), kld_loss.item(), vae_loss
     
+
+        
     @torch.no_grad()
     def evaluate_policy(self, num_games, deterministic = False):
         episode_length_his = []
@@ -444,11 +387,7 @@ class BPTT:
         episode_length = torch.zeros(self.num_envs, dtype = int)
         episode_gamma = torch.ones(self.num_envs, dtype = torch.float32, device = self.device)
         episode_discounted_loss = torch.zeros(self.num_envs, dtype = torch.float32, device = self.device)
-        if self.multi_stage:
-            self.env.training_stage = 1
-
         obs = self.env.reset()
-
         games_cnt = 0
 
         while games_cnt < num_games:
@@ -464,24 +403,16 @@ class BPTT:
                 actions[:, 1] = self.eval_p_filter.filter(actions[:, 1])
                 actions[:, 2] = self.eval_y_filter.filter(actions[:, 2])
                 actions[:, 3] = self.eval_thrust_filter.filter(actions[:, 3])
-                # Continue with the rest of your pipeline
                 vae_output, _ = self.vae.forward(self.obs_hist_buf)
-                vel_net_output, _ = self.vel_net.forward(self.obs_hist_buf)
-                obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(actions, vae_output, vel_net_output)
+                obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(actions, vae_output)
             else:
                 # No LPF
                 actions = self.actor(obs, deterministic = deterministic)
                 vae_output, _ = self.vae.forward(self.obs_hist_buf)
-                vel_net_output, _ = self.vel_net.forward(self.obs_hist_buf)
-                obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(torch.tanh(actions), vae_output, vel_net_output)
+                obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(torch.tanh(actions), vae_output)
             
             self.obs_hist_buf = history_obs
-
-            # actions = self.actor(obs, deterministic = deterministic)
-            # obs, rew, done, _ = self.env.step(torch.tanh(actions))
-
             episode_length += 1
-
             done_env_ids = done.nonzero(as_tuple = False).squeeze(-1)
 
             episode_loss -= rew
@@ -514,24 +445,7 @@ class BPTT:
     def run(self, num_games):
         mean_policy_loss, mean_policy_discounted_loss, mean_episode_length = self.evaluate_policy(num_games = num_games, deterministic = not self.stochastic_evaluation)
         print_info('mean episode loss = {}, mean discounted loss = {}, mean episode length = {}'.format(mean_policy_loss, mean_policy_discounted_loss, mean_episode_length))
-    def pretrain_action(self):
-        rows = self.env.num_envs
-        # Generate values for each column
-        col1 = torch.cat([
-            torch.rand(rows // 2) * 0.3 - 0.85,  # Range: -0.75 to -0.25
-            torch.rand(rows // 2) * 0.3 + 0.35   # Range: 0.25 to 0.75
-        ])
-        col2 = torch.rand(rows) * 0.4 + 0.5  # Range: 0.7 ± 0.2
-        col3 = torch.cat([
-            torch.rand(rows // 2) * 0.15 - 0.15,  # Range: -0.15 to 0
-            torch.rand(rows // 2) * 0.15          # Range: 0 to 0.15
-        ])
-        col4 = torch.full((rows,), 0.327)  # Constant value 0.327
 
-        # Combine into a single tensor and move to the assigned device
-        action = torch.stack([col1, col2, col3, col4], dim=1).to(self.env.device)
-
-        return action
 
     def train(self):
         self.start_time = time.time()
@@ -561,7 +475,7 @@ class BPTT:
             self.time_report.start_timer("compute actor loss")
 
             self.time_report.start_timer("forward simulation")
-            actor_loss = self.compute_actor_loss()
+            actor_loss, vae_loss = self.compute_actor_loss()
             self.time_report.end_timer("forward simulation")
 
             self.time_report.start_timer("backward simulation")
@@ -574,23 +488,20 @@ class BPTT:
                 if self.truncate_grad:
                     clip_grad_norm_(self.actor.parameters(), self.grad_norm)
                 self.grad_norm_after_clip = tu.grad_norm(self.actor.parameters()) 
-                if torch.isnan(self.grad_norm_before_clip):
-                    # JIE
-                    print('here!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! NaN gradient')
-                    import IPython
-                    IPython.embed()
+                
+                # sanity check
+                if torch.isnan(self.grad_norm_before_clip) or self.grad_norm_before_clip > 1000000.:
+                    print('NaN gradient')
                     for params in self.actor.parameters():
                         params.grad.zero_()
                 if torch.isnan(self.grad_norm_before_clip) or self.grad_norm_before_clip > 1000000.:
                     print('NaN gradient')
                     raise ValueError
-                    self.save("nan_policy")
 
             self.time_report.end_timer("compute actor loss")
+            self.vae_update(vae_loss)
 
             return actor_loss
-
-
 
         # setup wandb
         self.hyper_parameter = self.env.hyper_parameter
@@ -599,74 +510,26 @@ class BPTT:
             "architecture": "shac",
             "epochs": self.max_epochs,
             "episodes": self.max_episode_length,
-            # "batchsize": self.batch_size,
             "num_players": self.env.num_envs,
             }
         self.hyper_parameter.update(train_parameter)
-        wandb.init(
-            # set the wandb project where this run will be logged
-            project=f'{self.env.agent_name}-{self.map_name}-BPTT',
-            # track hyperparameters and run metadata
-            config=self.hyper_parameter
-        )
+
+        self.wandb_start = False
+        try:
+            wandb.init(
+                project=f'{self.env.agent_name}-{self.map_name}',
+                config=self.hyper_parameter
+            )
+            self.wandb_start = True
+        except Exception as e:
+            print_info(f'wandb init failed: {e}')
+            self.wandb_start = False
 
 
-        # pretrain offline vel_net
-        if self.pretrain_vel_net:
-            print_info('pretraining VEL_NET with large roll')
-            for epoch in range(self.pretrain_epoch):
-                obs, privilege_obs = self.env.initialize_trajectory()
-                
-                mean_vel_loss = 0
-                actions = self.pretrain_action() # steady actions to get large speed
-                for i in range(self.pretrain_steps_num):
-                    # collect data for critic training
-                    with torch.no_grad():
-                        # # TODO: ugly implementation
-                        obs = torch.nan_to_num(obs, nan=0.0, posinf=1e3, neginf=-1e3)
-                        privilege_obs = torch.nan_to_num(privilege_obs, nan=0.0, posinf=1e3, neginf=-1e3)
-
-
-                    # # TODO: bad implementation
-                    # invalid_rows = torch.isnan(actions).any(dim=1) | torch.isinf(actions).any(dim=1)
-                    # actions[invalid_rows] = 0
-                    vae_output, _ = self.vae.forward(self.obs_hist_buf)
-                    vel_net_output, _ = self.vel_net.forward(self.obs_hist_buf)
-                    obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(actions, vae_output, vel_net_output)
-                    self.obs_hist_buf = history_obs
-
-                    # update VEL_NET
-                    vel_loss = self.vel_net_closure(obs, vel_obs, history_obs, done)
-                    mean_vel_loss += vel_loss
-                
-                mean_vel_loss /= self.pretrain_steps_num
-                self.vel_net_loss = mean_vel_loss
-                print('pretrain iter {}, vel_net loss {:.5f}'.format(epoch, self.vel_net_loss))
-
+        # main training process
         for epoch in range(self.max_epochs):
-            # curriculum setting
-            if self.curriculum:
-                if epoch == 150:
-                    info = self.env.change_curriculum(1)
-                    print(f'curriculum has been changing: {info}')
-                elif epoch == 300:
-                    info = self.env.change_curriculum(2)
-                    print(f'curriculum has been changing: {info}')
-                elif epoch == 450:
-                    info = self.env.change_curriculum(3)
-                    print(f'curriculum has been changing: {info}')
-                elif epoch == 600:
-                    info = self.env.change_curriculum(0)
-                    print(f'curriculum has been changing: {info}')
-
-            # multi-stage training (using GT_vel or VAE_vel)
-            if self.multi_stage:
-                if epoch == self.stage_change_time:
-                    self.env.training_stage = 1
-                    self.vel_net_optimizer = torch.optim.AdamW(self.vel_net.parameters(), betas = [0.7, 0.95], lr = self.vel_net_lr, weight_decay=1e-2)
-                    print_info(f'change to use vae velo, velo net lr reset to {self.vel_net_lr}')
-
-            # multi-stage training (using GT_vel or VAE_vel)
+            time_start_epoch = time.time()
+            # Multi gate training process
             if self.multi_gate:
                 if (epoch+1) % self.gate_change_time == 0:
                     self.change_gate_count += 1
@@ -677,7 +540,6 @@ class BPTT:
                     self.actor_optimizer = torch.optim.AdamW(self.actor.parameters(), betas = [0.7, 0.95], lr = self.actor_lr, weight_decay=5e-3)
                     print_info(f'map has been changed to {next_map_name}, actor lr reset to {self.actor_lr}')
 
-            time_start_epoch = time.time()
 
             # learning rate schedule
             if self.lr_schedule == 'linear':
@@ -691,13 +553,6 @@ class BPTT:
                 vae_lr = (1e-5 - self.vae_lr) * float(epoch / self.max_epochs) + self.vae_lr
                 for param_group in self.vae_optimizer.param_groups:
                     param_group['lr'] = vae_lr
-                if self.env.training_stage == 0:
-                    vel_net_lr = (1e-5 - self.vel_net_lr) * float(epoch / self.max_epochs) + self.vel_net_lr
-                    if self.vel_net_early_stop and (epoch > self.vel_net_stop_time):
-                        vel_net_lr = 0.0
-                for param_group in self.vel_net_optimizer.param_groups:
-                    param_group['lr'] = vel_net_lr
-
             # learning rate schedule
             elif self.lr_schedule == 'cosine':
                 # Calculate the cosine schedule
@@ -709,15 +564,8 @@ class BPTT:
                 vae_lr = 1e-5 + (self.vae_lr - 1e-5) * 0.5 * (1 + math.cos(math.pi * epoch / self.max_epochs))
                 for param_group in self.vae_optimizer.param_groups:
                     param_group['lr'] = vae_lr
-                if self.env.training_stage == 0:
-                    vel_net_lr = 1e-5 + (self.vel_net_lr - 1e-5) * 0.5 * (1 + math.cos(math.pi * epoch / self.max_epochs))
-                    if self.vel_net_early_stop and (epoch > self.vel_net_stop_time):
-                        vel_net_lr = 0.0
-                for param_group in self.vel_net_optimizer.param_groups:
-                    param_group['lr'] = vel_net_lr
             else:
                 lr = self.actor_lr
-
 
 
             # train actor
@@ -740,7 +588,6 @@ class BPTT:
                     print_info("save best policy with loss {:.2f}".format(mean_policy_loss))
                     self.save()
                     self.best_policy_loss = mean_policy_loss
-
             else:
                 mean_policy_loss = np.inf
                 mean_policy_discounted_loss = np.inf
@@ -754,36 +601,28 @@ class BPTT:
                 self.save(self.name + "policy_iter{}_reward{:.3f}".format(self.iter_count, -mean_policy_loss))
             # update wandb
             wandb_record_loss = mean_policy_loss
-            wandb.log({"actor loss": wandb_record_loss, 
-                       "VAE_loss": self.vae_loss,
-                       "VEL_NET_loss": self.vel_net_loss,
-                       "recons_loss": self.mean_recons_loss,
-                       "kld_loss": self.mean_kld_loss,
-                       "episode_length": mean_episode_length,
-                       "max_grad":self.max_grad,
-                        "mean_grad": self.mean_grad,
-                        "learning rate": actor_lr
-                       })
+            if self.wandb_start:
+                wandb.log({"actor loss": wandb_record_loss, 
+                        "VAE_loss": self.vae_loss,
+                        "recons_loss": self.mean_recons_loss,
+                        "kld_loss": self.mean_kld_loss,
+                        "episode_length": mean_episode_length,
+                        "max_grad":self.max_grad,
+                            "mean_grad": self.mean_grad,
+                            "learning rate": actor_lr
+                        })
 
         self.time_report.end_timer("algorithm")
-
         self.time_report.report()
         self.env.time_report.report()
         
         self.save('final_policy')
-
-        # save reward/length history
         self.episode_loss_his = np.array(self.episode_loss_his)
         self.episode_discounted_loss_his = np.array(self.episode_discounted_loss_his)
         self.episode_length_his = np.array(self.episode_length_his)
-        # np.save(open(os.path.join(self.log_dir, 'episode_loss_his.npy'), 'wb'), self.episode_loss_his)
-        # np.save(open(os.path.join(self.log_dir, 'episode_discounted_loss_his.npy'), 'wb'), self.episode_discounted_loss_his)
-        # np.save(open(os.path.join(self.log_dir, 'episode_length_his.npy'), 'wb'), self.episode_length_his)
-
+        
         # evaluate the final policy's performance
         self.run(self.num_envs)
-
-        # self.close()
     
     def play(self, cfg):
         ckpt_path = cfg['params']['general']['checkpoint']
@@ -794,16 +633,13 @@ class BPTT:
     def save(self, filename = None):
         if filename is None:
             filename = 'best_policy'
-        # torch.save([self.actor, self.obs_rms], os.path.join(self.log_dir, "{}.pt".format(filename)))
-        torch.save([self.actor, self.obs_rms, self.vae, self.vel_net, self.env.visual_net], os.path.join(self.log_dir, "{}.pt".format(filename)))
-    
+        torch.save([self.actor, self.obs_rms, self.vae, self.env.visual_net], os.path.join(self.log_dir, "{}.pt".format(filename)))
+
     def load(self, path):
+        print(path)
         checkpoint = torch.load(path)
         self.actor = checkpoint[0].to(self.device)
         self.obs_rms = checkpoint[1].to(self.device)
         self.vae = checkpoint[2].to(self.device)
-        self.vel_net = checkpoint[3].to(self.device)
-        self.env.visual_net = checkpoint[4].to(self.device)
+        self.env.visual_net = checkpoint[3].to(self.device)
         print_info(f"all nets have been loaded")
-        
-    

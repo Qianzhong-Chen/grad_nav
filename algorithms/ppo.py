@@ -1,6 +1,6 @@
 import sys, os
+os.environ["WANDB_MODE"] = "disabled"
 from torch.nn.utils.clip_grad import clip_grad_norm_
-
 project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(project_dir)
 
