@@ -33,7 +33,6 @@ params:
     actor_learning_rate: 1e-4 # adam
     critic_learning_rate: 1e-4 # adam
     vae_learning_rate: 5e-4
-    vel_net_learning_rate: 5e-4
     lr_schedule: cosine # ['constant', 'linear', 'cosine']
     target_critic_alpha: 0.8
     obs_rms: True
@@ -49,10 +48,10 @@ params:
     truncate_grads: True
     num_actors: 128
     save_interval: 50
-    max_epochs: 200 # total training iterations
+    max_epochs: 1800 # total training iterations
     domain_randomization: True
     multi_gate: True
-    gate_change_time: 10
+    gate_change_time: 100
     domain_randomization: True
 
     # LPF

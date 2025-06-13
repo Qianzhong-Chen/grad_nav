@@ -1,1579 +1,782 @@
-# Copyright (c) 2022 NVIDIA CORPORATION.  All rights reserved.
-# NVIDIA CORPORATION and its licensors retain all intellectual property
-# and proprietary rights in and to this software, related documentation
-# and any modifications thereto.  Any use, reproduction, disclosure or
-# distribution of this software and related documentation without an express
-# license agreement from NVIDIA CORPORATION is strictly prohibited.
+import sys, os
+from torch.nn.utils.clip_grad import clip_grad_norm_
 
-from envs.dflex_env import DFlexEnv
-import math
+project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(project_dir)
+
+import time
+import numpy as np
+import copy
 import torch
+from torchvision import models, transforms
+import torch.nn as nn
+import torch.distributions as dist
+import yaml
+import envs
+import models.actor
+import models.critic
+from utils.common import *
+import utils.torch_utils as tu
+from utils.running_mean_std import RunningMeanStd
+from utils.dataset import CriticDataset
+from utils.time_report import TimeReport
+from utils.average_meter import AverageMeter
+from models.vae import VAE
+import wandb
 torch.autograd.set_detect_anomaly(True)
 
-from torchvision import models, transforms
-from torchvision.transforms import Resize
-from torchvision.io import write_video
-import torch.nn as nn
-import os
-import sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from pathlib import Path
-from rich.console import Console
-from PIL import Image
-from envs.assets.quadrotor_dynamics_advanced import QuadrotorSimulator
-# from envs.assets.visiual_buffer import VisualBuffer
+class BatchLowPassFilter:
+    def __init__(self, alpha=0.1, batch_size=1):
+        self.alpha = alpha
+        self.last_values = None  
+    def filter(self, new_values):
+        if self.last_values is None:
+            self.last_values = new_values.clone().detach()
+        else:
+            self.last_values = self.alpha * new_values + (1 - self.alpha) * self.last_values.clone().detach()
+        return self.last_values
 
-import numpy as np
-np.set_printoptions(precision=5, linewidth=256, suppress=True)
+class PPO:
+    def __init__(self, cfg):
+        env_fn = getattr(envs, cfg["params"]["diff_env"]["name"])
+        self.map_name = cfg["params"]["config"].get("map_name", 'gate_mid')
 
-# try:
-#     from pxr import Usd
-# except ModuleNotFoundError:
-#     print("No pxr package")
+        seeding(cfg["params"]["general"]["seed"])
+        env_hyper = cfg["params"].get("env_hyper", None)
+        self.env = env_fn(num_envs = cfg["params"]["config"]["num_actors"], \
+                            device = cfg["params"]["general"]["device"], \
+                            render = cfg["params"]["general"]["render"], \
+                            seed = cfg["params"]["general"]["seed"], \
+                            episode_length=cfg["params"]["diff_env"].get("episode_length", 250), \
+                            stochastic_init = cfg["params"]["diff_env"].get("stochastic_env", True), \
+                            MM_caching_frequency = cfg["params"]['diff_env'].get('MM_caching_frequency', 1), \
+                            map_name = self.map_name,
+                            env_hyper = env_hyper,
+                            no_grad = True)
 
-from utils import torch_utils as tu
-from utils.common import *
-from utils.gs_local import GS, get_gs
-from utils.rotation import quaternion_to_euler, quaternion_yaw_forward
-from utils.model_util import quat_from_axis_angle
-from utils.model import ModelBuilder
-from utils.point_cloud_util import ObstacleDistanceCalculator
-from utils.traj_planner_global import TrajectoryPlanner
-from utils.hist_obs_buffer import ObsHistBuffer
-from utils.time_report import TimeReport
-import time
-import matplotlib.pyplot as plt
-# squeezenet + trainable linear layer
-import torchvision.models as models
+        print('num_envs = ', self.env.num_envs)
+        print('num_actions = ', self.env.num_actions)
+        print('num_obs = ', self.env.num_obs)
 
-SINGLE_VISUAL_INPUT_SIZE = 24
-HISTORY_BUFFER_NUM = 5
-LATENT_VECT_NUM = 16
+        self.num_envs = self.env.num_envs
+        self.num_obs = self.env.num_obs
+        self.num_privilege_obs = self.env.num_privilege_obs
+        self.num_actions = self.env.num_actions
+        self.max_episode_length = self.env.episode_length
+        self.device = cfg["params"]["general"]["device"]
 
-class VisualPerceptionNet(nn.Module):
-    def __init__(self, input_channels=4):
-        super(VisualPerceptionNet, self).__init__()
-        # Set up the SqueezeNet backbone
-        self.squeezenet = models.squeezenet1_0(pretrained=True)
+        self.gamma = cfg['params']['config'].get('gamma', 0.99)
         
-        # Modify the first convolution layer to accept more channels (e.g., 4 for RGB + Depth)
-        self.squeezenet.features[0] = nn.Conv2d(input_channels, 96, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+        self.critic_method = cfg['params']['config'].get('critic_method', 'one-step') # ['one-step', 'td-lambda']
+        if self.critic_method == 'td-lambda':
+            self.lam = cfg['params']['config'].get('lambda', 0.95)
 
-        # Freeze SqueezeNet parameters so they are not updated during training
-        for param in self.squeezenet.parameters():
-            param.requires_grad = False
-
-        # Add an adaptive average pooling to get the output to [batch_size, 512, 1, 1]
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-
-        # Add a 1D convolution layer to downsample from 512 to 32
-        # self.conv1d = nn.Conv1d(512, SINGLE_VISUAL_INPUT_SIZE, kernel_size=1)
-        self.fc = nn.Linear(512, SINGLE_VISUAL_INPUT_SIZE)
-
-    def forward(self, x):
-        # Freeze the SqueezeNet layers but keep the 1D convolution layer trainable
-        with torch.no_grad():
-            x = self.squeezenet.features(x)  # SqueezeNet backbone is frozen
-            x = self.pool(x)  # Adaptive pooling to reduce spatial dimensions to 1x1
-        x = torch.flatten(x, 1)  # Flatten to shape [batch_size, 512]
+        self.steps_num = cfg["params"]["config"]["steps_num"]
+        # PPO special
+        self.alg_name = 'PPO'
+        self.actor_update_steps = cfg["params"]["config"]["actor_update_steps"]
+        self.critic_update_steps = cfg["params"]["config"]["critic_update_steps"]
+        self.epsilon = cfg['params']['config'].get('epsilon', 0.2)
+        self.entropy_coeff = cfg['params']['config'].get('entropy_coeff', 0.01)
+        self.max_epochs = cfg["params"]["config"]["max_epochs"]
+        self.actor_lr = float(cfg["params"]["config"]["actor_learning_rate"])
+        self.critic_lr = float(cfg['params']['config']['critic_learning_rate'])
+        self.vae_lr = float(cfg['params']['config'].get('vae_learning_rate', 1e-4))
+        # lr schedule
+        self.lr_schedule = cfg['params']['config'].get('lr_schedule', 'linear')
+        self.init_actor_lr = self.actor_lr
+        self.init_critic_lr = self.critic_lr
+        self.init_vae_lr = self.vae_lr
+        # domain_randomization
+        self.domain_randomization = cfg['params']['config'].get('domain_randomization', False)
+        if self.domain_randomization:
+            self.env.domain_randomization = True
         
-        # Conv
-        # x = x.unsqueeze(-1)  # Add a channel dimension for 1D convolution
-        # x = self.conv1d(x).squeeze(-1)  # Apply 1D convolution and remove the extra dimension
+        self.target_critic_alpha = cfg['params']['config'].get('target_critic_alpha', 0.4)
+        self.obs_rms = None
+        if cfg['params']['config'].get('obs_rms', False):
+            self.obs_rms = RunningMeanStd(shape = (self.num_obs), device = self.device)
+            self.privilege_obs_rms = RunningMeanStd(shape = (self.num_privilege_obs), device = self.device)
+            
+        self.ret_rms = None
+        if cfg['params']['config'].get('ret_rms', False):
+            self.ret_rms = RunningMeanStd(shape = (), device = self.device)
+
+        self.rew_scale = cfg['params']['config'].get('rew_scale', 1.0)
+        self.critic_iterations = cfg['params']['config'].get('critic_iterations', 16)
+        self.num_batch = cfg['params']['config'].get('num_batch', 4)
+        self.batch_size = self.num_envs * self.steps_num // self.num_batch
+        self.name = cfg['params']['config'].get('name', "Ant")
+
+        self.truncate_grad = cfg["params"]["config"]["truncate_grads"]
+        self.grad_norm = cfg["params"]["config"]["grad_norm"]
+
+        # LPF
+        self.train_LPF = cfg['params']['config'].get('LPF_train', False)
+        self.train_LPF_val = cfg['params']['config'].get('LPF_val', 0.5)
+        if self.train_LPF:
+            self.train_r_filter = BatchLowPassFilter(alpha=self.train_LPF_val, batch_size=self.num_envs)
+            self.train_p_filter = BatchLowPassFilter(alpha=self.train_LPF_val, batch_size=self.num_envs)
+            self.train_y_filter = BatchLowPassFilter(alpha=self.train_LPF_val, batch_size=self.num_envs)
+            self.train_thrust_filter = BatchLowPassFilter(alpha=self.train_LPF_val, batch_size=self.num_envs)
+
+        self.eval_LPF = cfg['params']['config']['player'].get('LPF_eval', False)
+        self.eval_LPF_val = cfg['params']['config']['player'].get('LPF_val', 0.5)
+        if self.eval_LPF:
+            self.eval_r_filter = BatchLowPassFilter(alpha=self.eval_LPF_val, batch_size=self.num_envs)
+            self.eval_p_filter = BatchLowPassFilter(alpha=self.eval_LPF_val, batch_size=self.num_envs)
+            self.eval_y_filter = BatchLowPassFilter(alpha=self.eval_LPF_val, batch_size=self.num_envs)
+            self.eval_thrust_filter = BatchLowPassFilter(alpha=self.eval_LPF_val, batch_size=self.num_envs)
+
+
         
-        # FC layer
-        x = self.fc(x)
+        if cfg['params']['general']['train']:
+            self.log_dir = cfg["params"]["general"]["logdir"]
+            os.makedirs(self.log_dir, exist_ok = True)
+            # save config
+            save_cfg = copy.deepcopy(cfg)
+            if 'general' in save_cfg['params']:
+                deleted_keys = []
+                for key in save_cfg['params']['general'].keys():
+                    if key in save_cfg['params']['config']:
+                        deleted_keys.append(key)
+                for key in deleted_keys:
+                    del save_cfg['params']['general'][key]
 
-        return x
+            yaml.dump(save_cfg, open(os.path.join(self.log_dir, 'cfg.yaml'), 'w'))
+            # save interval
+            self.save_interval = cfg["params"]["config"].get("save_interval", 500)
+            # stochastic inference
+            self.stochastic_evaluation = True
+        else:
+            self.stochastic_evaluation = not (cfg['params']['config']['player'].get('determenistic', False) or cfg['params']['config']['player'].get('deterministic', False))
+            self.steps_num = self.env.episode_length
 
+        # create actor critic network
+        self.actor_name = cfg["params"]["network"].get("actor", 'ActorStochasticMLP') # choices: ['ActorDeterministicMLP', 'ActorStochasticMLP']
+        self.critic_name = cfg["params"]["network"].get("critic", 'CriticMLP')
+        actor_fn = getattr(models.actor, self.actor_name)
+        self.actor = actor_fn(self.num_obs, self.num_actions, cfg['params']['network'], device = self.device)
+        critic_fn = getattr(models.critic, self.critic_name)
+        self.critic = critic_fn(self.num_privilege_obs, cfg['params']['network'], device = self.device)
+        self.all_params = list(self.actor.parameters()) + list(self.critic.parameters())
+        self.target_critic = copy.deepcopy(self.critic)
 
-class QuadrotorGSMaskPosTrajGlobalPPOEnv(DFlexEnv):
+        # creat VAE
+        self.num_history = self.env.num_history
+        self.num_latent = self.env.num_latent
+        self.kl_weight = cfg["params"]["vae"].get("kl_weight", 1.0)
+        self.vae_encoder_dim = cfg["params"]["vae"].get("encoder_units", [256, 256, 256])
+        self.vae_decoder_dim = cfg["params"]["vae"].get("decoder_units", [32, 64, 128, 256])
+        self.vae = VAE(self.num_obs, self.num_history, self.num_latent, kld_weight=self.kl_weight, activation='elu', decoder_hidden_dims=self.vae_decoder_dim, encoder_hidden_dims=self.vae_encoder_dim).to(self.device)
 
-    def __init__(self, 
-                 render=False, 
-                 device='cuda:0', 
-                 num_envs=4096, 
-                 seed=0, 
-                 episode_length=1000, 
-                 no_grad=True, 
-                 stochastic_init=False, 
-                 MM_caching_frequency = 1, 
-                 early_termination = True, 
-                 map_name='gate_mid'
-                 ):
-       
-        self.num_privilege_obs = 30 + SINGLE_VISUAL_INPUT_SIZE + LATENT_VECT_NUM
-        num_obs = 22 + SINGLE_VISUAL_INPUT_SIZE + LATENT_VECT_NUM # correspond with self.obs_buf
-        num_act = 4
-        self.agent_name = 'quadrotor_gs_mask_pos_traj_global_ppo'
-        self.num_history = HISTORY_BUFFER_NUM
-        self.num_latent = LATENT_VECT_NUM
-    
-        print('----------------------------', device)
-        super(QuadrotorGSMaskPosTrajGlobalPPOEnv, self).__init__(num_envs, num_obs, num_act, episode_length, MM_caching_frequency, seed, no_grad, render, device)
-        self.stochastic_init = stochastic_init
-        self.early_termination = early_termination
-        self.device = device
-        self.height_target = 1.2
+        if cfg['params']['general']['train']:
+            self.save('init_policy')
+
+        # initialize optimizer
+        self.actor_optimizer = torch.optim.AdamW(self.actor.parameters(), betas = cfg['params']['config']['betas'], lr = self.actor_lr, weight_decay=5e-3)
+        self.critic_optimizer = torch.optim.AdamW(self.critic.parameters(), betas = cfg['params']['config']['betas'], lr = self.critic_lr, weight_decay=5e-3)
+        self.vae_optimizer = torch.optim.AdamW(self.vae.parameters(), betas = cfg['params']['config']['betas'], lr = self.vae_lr, weight_decay=1e-2)
+
+        # replay buffer
+        self.obs_buf = torch.zeros((self.steps_num, self.num_envs, self.num_obs), dtype = torch.float32, device = self.device)
+        self.privilege_obs_buf = torch.zeros((self.steps_num, self.num_envs, self.num_privilege_obs), dtype = torch.float32, device = self.device)
+        self.obs_hist_buf = torch.zeros((self.num_envs, self.num_obs*self.num_history), dtype = torch.float32, device = self.device)
+        self.rew_buf = torch.zeros((self.steps_num, self.num_envs), dtype = torch.float32, device = self.device)
+        self.done_mask = torch.zeros((self.steps_num, self.num_envs), dtype = torch.float32, device = self.device)
+        self.next_values = torch.zeros((self.steps_num, self.num_envs), dtype = torch.float32, device = self.device)
+        self.target_values = torch.zeros((self.steps_num, self.num_envs), dtype = torch.float32, device = self.device)
+        self.ret = torch.zeros((self.num_envs), dtype = torch.float32, device = self.device)
+
+        
+        if cfg['params']['general']['checkpoint'] != 'Base':
+            ckpt_path = cfg['params']['general']['checkpoint']
+            ckpt_dir = os.path.dirname(ckpt_path)
+            self.load(cfg['params']['general']['checkpoint'])
+            print_info(f'actor critic networks recovered from {ckpt_path}')
+
+        # for kl divergence computing
+        self.old_mus = torch.zeros((self.steps_num, self.num_envs, self.num_actions), dtype = torch.float32, device = self.device)
+        self.old_sigmas = torch.zeros((self.steps_num, self.num_envs, self.num_actions), dtype = torch.float32, device = self.device)
+        self.mus = torch.zeros((self.steps_num, self.num_envs, self.num_actions), dtype = torch.float32, device = self.device)
+        self.sigmas = torch.zeros((self.steps_num, self.num_envs, self.num_actions), dtype = torch.float32, device = self.device)
+
+        # counting variables
+        self.iter_count = 0
+        self.step_count = 0
+
+        # loss variables
+        self.episode_length_his = []
+        self.episode_loss_his = []
+        self.episode_discounted_loss_his = []
+        self.episode_loss = torch.zeros(self.num_envs, dtype = torch.float32, device = self.device)
+        self.episode_discounted_loss = torch.zeros(self.num_envs, dtype = torch.float32, device = self.device)
+        self.episode_gamma = torch.ones(self.num_envs, dtype = torch.float32, device = self.device)
+        self.episode_length = torch.zeros(self.num_envs, dtype = int, device = self.device)
+        self.best_policy_loss = np.inf
+        self.actor_loss = np.inf
+        self.value_loss = np.inf
+        self.vae_loss = np.inf
+        self.mean_recons_loss = np.inf
+        self.mean_kld_loss = np.inf
+        
+        # average meter
+        self.episode_loss_meter = AverageMeter(1, 100).to(self.device)
+        self.episode_discounted_loss_meter = AverageMeter(1, 100).to(self.device)
+        self.episode_length_meter = AverageMeter(1, 100).to(self.device)
+
+        # timer
         self.time_report = TimeReport()
-        self.time_report.add_timer("dynamic simulation")
-        self.time_report.add_timer("3D GS inference")
-        self.time_report.add_timer("point cloud collision check")
 
-        # setup map
-        maps = {
-            "gate_left":"sv_917_3_left_nerfstudio",
-            "gate_right":"sv_917_3_right_nerfstudio",
-            "gate_mid":"sv_1007_gate_mid",
-            "clutter":"sv_712_nerfstudio",
-            "backroom":"sv_1018_2",
-            "flightroom":"sv_1018_3",
-        }
-        self.map_name = map_name
+        # grad recore
+        self.max_grad = 0
+        self.mean_grad = 0
 
-        self.init_sim()
-        self.episode_length = episode_length
 
-        # GS model
-        gs_dir = Path(
-        "/home/qianzhong/DiffRL_NeRF/envs/assets/gs_data"
-        )
-        resolution_quality = 0.4
-        self.gs = get_gs(self.map_name, gs_dir, resolution_quality)
+    def compute_actor_loss(self, advantages, log_probs, actions):
+        """
+        Compute PPO loss using matrix operations instead of a for loop.
+        """
+        new_log_probs, entropy = self.get_log_prob_and_entropy(self.actor, self.obs_buf, actions)
+        ratio = torch.exp(new_log_probs - log_probs)  # Shape: [steps_num, batch_size]
+        # compute surrogate losses
+        surrogate1 = ratio * advantages  # Shape: [steps_num, batch_size]
+        surrogate2 = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantages  
+        # sanity enforcement
+        surrogate1 = torch.nan_to_num(surrogate1, nan=0.0, posinf=1e4, neginf=-1e4)
+        surrogate2 = torch.nan_to_num(surrogate2, nan=0.0, posinf=1e4, neginf=-1e4)
+        # compute actor loss
+        actor_loss = -torch.min(surrogate1, surrogate2).mean() + self.entropy_coeff * entropy.mean()
+        # sanity check
+        if torch.isnan(actor_loss) or torch.isinf(actor_loss):
+            print('nan')
+
+        return actor_loss
+
+    
+    def vae_update(self, vae_loss):
+        self.vae_optimizer.zero_grad()
+        vae_loss.backward()
+        nn.utils.clip_grad_norm_(self.vae.parameters(), self.grad_norm)
+        self.vae_optimizer.step()
+
+    def compute_vae_loss(self, obs, vel_obs, history_obs, done):
+        vae_loss_dict = self.vae.loss_fn(history_obs.clone().detach(), obs.clone().detach())
+        valid = (done == 0).squeeze()
+        vae_loss = torch.mean(vae_loss_dict['loss'][valid])
+        recons_loss = torch.mean(vae_loss_dict['recons_loss'][valid])
+        kld_loss = torch.mean(vae_loss_dict['kld_loss'][valid]) 
+        return recons_loss.item(), kld_loss.item(), vae_loss
+    
+    
+
+    @torch.no_grad()
+    def compute_target_values(self):
+        if self.critic_method == 'one-step':
+            self.target_values = self.rew_buf + self.gamma * self.next_values
+        elif self.critic_method == 'td-lambda':
+            Ai = torch.zeros(self.num_envs, dtype = torch.float32, device = self.device)
+            Bi = torch.zeros(self.num_envs, dtype = torch.float32, device = self.device)
+            lam = torch.ones(self.num_envs, dtype = torch.float32, device = self.device)
+            for i in reversed(range(self.steps_num)):
+                lam = lam * self.lam * (1. - self.done_mask[i]) + self.done_mask[i]
+                Ai = (1.0 - self.done_mask[i]) * (self.lam * self.gamma * Ai + self.gamma * self.next_values[i] + (1. - lam) / (1. - self.lam) * self.rew_buf[i])
+                Bi = self.gamma * (self.next_values[i] * self.done_mask[i] + Bi * (1.0 - self.done_mask[i])) + self.rew_buf[i]
+                self.target_values[i] = (1.0 - self.lam) * Ai + lam * Bi
+        else:
+            raise NotImplementedError
         
+        if torch.isnan(self.target_values).any() or torch.isinf(self.target_values).any():
+            print("NaN or Inf detected in target_values")
+            self.target_values = torch.nan_to_num(self.target_values, nan=0.0, posinf=1e2, neginf=-1e2)
+                    
+    
 
-        # navigation parameters
-
+    def compute_critic_loss(self, batch_sample):
         
-        if self.map_name == 'gate_mid':
-            target = (13.0, -2.0, 1.2) # in map absolute dimension, start with 0
-            target_xy = (13.0, -2.0)
-        if self.map_name == 'gate_left':
-            target = (13.0, -2.0, 1.2) # in map absolute dimension, start with 0
-            target_xy = (13.0, -2.0)
-        if self.map_name == 'gate_right':
-            target = (13.0, -2.0, 1.2) # in map absolute dimension, start with 0
-            target_xy = (13.0, -2.0)
-        if self.map_name == 'clutter':
-            target = (13.0, -2.0, 1.2) # in map absolute dimension, start with 0
-            target_xy = (13.0, -2.0)
-        self.target = tu.to_torch(list(target), 
-            device=self.device, requires_grad=True).repeat((self.num_envs, 1)) # navigation target
-        self.target_xy = tu.to_torch(list(target_xy), 
-            device=self.device, requires_grad=True).repeat((self.num_envs, 1)) # navigation target
-        # self.target_list = self.target.clone()
-        self.gs_origin_offset = torch.tensor([[-7.0, -0., -0.]] * self.num_envs, device=self.device) # (x,y,z); gs dimension for visual info
-        self.point_could_origin_offset = torch.tensor([[-6.0, -0., -0.]] * self.num_envs, device=self.device) # (x,y,z); point cloud dimension for obstacle distance & traj plan
+        obs = batch_sample['obs'].clone().float().to(self.critic.device)
+        obs = torch.nan_to_num(obs, nan=0.0, posinf=1e3, neginf=-1e3)
 
-        # setup point cloud
-        point_cloud_dir = Path(
-        "/home/qianzhong/DiffRL_NeRF/envs/assets/point_cloud"
-        )
-        self.point_cloud = ObstacleDistanceCalculator(ply_file=os.path.join(point_cloud_dir,f'{maps[self.map_name]}.ply'))
-        self.traj_planner = TrajectoryPlanner(ply_file=os.path.join(point_cloud_dir,f'{maps[self.map_name]}.ply'), 
-                                            safety_distance=0.3, 
-                                            batch_size=1, 
-                                            wp_distance=2.0,
-                                            verbose=False)
-        
-        # generate ref_traj
-        if self.map_name == 'gate_mid':
-            self.reward_wp = torch.tensor([[5.8, -0.1, 1.4], 
-                                        [9.7, 1.5, 0.6], 
-                                        [11.8, 0.0, 1.2],
-                                        [13.0, -2.0, 1.2]], device=self.device) # (x,y,z)
+        predicted_values = self.critic(obs).squeeze(-1)
+        if torch.isnan(predicted_values).any() or torch.isinf(predicted_values).any():
+            print("NaN or Inf detected in predicted_values")
+            predicted_values = torch.nan_to_num(predicted_values, nan=0.0, posinf=1e3, neginf=-1e3)
+
+        target_values = batch_sample['target_values'].to(self.critic.device).detach()
+        if torch.isnan(target_values).any() or torch.isinf(target_values).any():
+            print("NaN or Inf detected in target_values")
+            target_values = torch.nan_to_num(target_values, nan=0.0, posinf=1e3, neginf=-1e3)
+
+        critic_loss = ((predicted_values - target_values) ** 2).mean()
+        if torch.isnan(critic_loss).any() or torch.isinf(critic_loss).any():
+            print("NaN detected in critic_loss, skipping update")
+            critic_loss = torch.nan_to_num(critic_loss, nan=0.0, posinf=1e3, neginf=-1e3)
+
+        return critic_loss
+
+
+    def initialize_env(self):
+        self.env.clear_grad()
+        self.env.reset()
+
+    
+    def train(self):
+        self.initialize_env()
+
+        # setup wandb
+        self.hyper_parameter = self.env.hyper_parameter
+        train_parameter = {
+            "learning_rate": self.actor_lr,
+            "architecture": "shac",
+            "epochs": self.max_epochs,
+            "episodes": self.max_episode_length,
+            "batchsize": self.batch_size,
+            "num_players": self.env.num_envs,
+            }
+        self.hyper_parameter.update(train_parameter)
+        try:
+            wandb.init(
+                project=f'{self.env.agent_name}-{self.map_name}',
+                config=self.hyper_parameter
+            )
+            self.wandb_start = True
+        except Exception as e:
+            print_info(f'wandb init failed: {e}')
+            self.wandb_start = False
+
+        for epoch in range(self.max_epochs):
+            time_start_epoch = time.time()
+            # Trajectory collection
+            trajectories = self.collect_trajectories()
+
+            # Compute advantages and returns
+            advantages, returns = self.compute_gae(
+                rewards=trajectories["rewards"],
+                dones=trajectories["dones"],
+                values=trajectories["values"]
+            )
+
+            if torch.isnan(advantages).any() or torch.isinf(advantages).any():
+                print("NaN or Inf detected in advantages")
+                advantages = torch.nan_to_num(advantages, nan=0.0, posinf=1e3, neginf=-1e3)
+
+            # train actor
+            for _ in range(self.actor_update_steps):
+                self.actor_optimizer.zero_grad()
+                actor_loss = self.compute_actor_loss(advantages.detach(), 
+                                                     trajectories["log_probs"].detach(), 
+                                                     trajectories["actions"].detach())
+                actor_loss.backward()
+                clip_grad_norm_(self.actor.parameters(), self.grad_norm)
+                self.actor_optimizer.step()
+                self.actor_loss = actor_loss.detach().cpu().item()
+
+            # train critic
+            with torch.no_grad():
+                self.compute_target_values()
+                dataset = CriticDataset(self.batch_size, self.privilege_obs_buf, self.target_values, drop_last = False)
+
+            self.value_loss = 0.
+            for j in range(self.critic_iterations):
+                total_critic_loss = 0.
+                batch_cnt = 0
+                for i in range(len(dataset)):
+                    batch_sample = dataset[i]
+                    self.critic_optimizer.zero_grad()
+                    training_critic_loss = self.compute_critic_loss(batch_sample)
+                    training_critic_loss.backward()
+                    
+                    # ugly fix for simulation nan problem
+                    for params in self.critic.parameters():
+                        params.grad.nan_to_num_(0.0, 0.0, 0.0)
+                    if self.truncate_grad:
+                        clip_grad_norm_(self.critic.parameters(), self.grad_norm)
+                    self.critic_optimizer.step()
+                    total_critic_loss += training_critic_loss
+                    batch_cnt += 1
+                
+                self.value_loss = (total_critic_loss / batch_cnt).detach().cpu().item()
+                print('value iter {}/{}, loss = {:7.6f}'.format(j + 1, self.critic_iterations, self.value_loss), end='\r')
+
+            # train VAE
+            vae_loss = trajectories["vae_loss"] 
+            self.vae_update(vae_loss)
+
+               
+            time_end_epoch = time.time()
+            self.iter_count += 1
+
+            if len(self.episode_loss_his) > 0:
+                mean_episode_length = self.episode_length_meter.get_mean()
+                mean_policy_loss = self.episode_loss_meter.get_mean()
+                mean_policy_discounted_loss = self.episode_discounted_loss_meter.get_mean()
+
+                if mean_policy_loss < self.best_policy_loss:
+                    print_info("save best policy with loss {:.2f}".format(mean_policy_loss))
+                    self.save()
+
+                    self.best_policy_loss = mean_policy_loss
+                
+            else:
+                mean_policy_loss = np.inf
+                mean_policy_discounted_loss = np.inf
+                mean_episode_length = 0
             
             
-            # plane the global ref trajectory
-            traj_wp = self.reward_wp + self.point_could_origin_offset[0].repeat((self.reward_wp.shape[0],1))
-            traj_start = torch.tensor([[-6.0, 0, 1.2]], device=self.device)
-            traj_dest = torch.tensor([[7.0, -2.0, 1.2]], device=self.device)
-            self.ref_traj = self.traj_planner.plan_trajectories(traj_start, traj_dest, [traj_wp])
-            self.ref_traj = torch.tensor(self.ref_traj[0], device = self.device)
+            print('iter {}: ep loss {:.2f}, ep discounted loss {:.2f}, vae loss {:.2f}, ep len {:.1f}, fps total {:.2f}, value loss {:.2f}'.format(\
+                self.iter_count, mean_policy_loss, mean_policy_discounted_loss, self.vae_loss, mean_episode_length, self.steps_num * self.num_envs / (time_end_epoch - time_start_epoch), self.value_loss))
 
-         # generate ref_traj
-        if self.map_name == 'gate_left':
-            self.reward_wp = torch.tensor([[5.8, 1.2, 1.4], 
-                                        [9.7, 1.2, 0.6], 
-                                        [11.8, 0.0, 1.2],
-                                        [13.0, -2.0, 1.2]], device=self.device) # (x,y,z)
+            if self.wandb_start:
+                wandb.log({"ep_loss": mean_policy_loss,
+                        "VAE_loss": self.vae_loss,
+                        "episode_length": mean_episode_length,
+                        "value_loss":self.value_loss,
+                        "actor_loss": self.actor_loss,
+                        "value_grad_norm": torch.norm(torch.cat([p.grad.view(-1) for p in self.critic.parameters()])),
+                        "actor_grad_norm": torch.norm(torch.cat([p.grad.view(-1) for p in self.actor.parameters()])),
+                        })
+        
+            if self.save_interval > 0 and (self.iter_count % self.save_interval == 0):
+                self.save("policy_iter{}_reward{:.3f}".format(self.iter_count, -mean_policy_loss))
+
+
+    def compute_gae(self, rewards, dones, values, gamma=0.99, lam=0.95):
+        T, N = rewards.shape
+        advantages = torch.zeros((T, N), device=rewards.device)
+        returns = torch.zeros((T, N), device=rewards.device)
+
+        # Initialize the last advantage
+        next_advantage = 0
+        for t in reversed(range(T)):
+            if t == T - 1:
+                next_value = values[t + 1]
+            else:
+                next_value = values[t + 1]
+                
+            next_is_not_terminal = 1.0 - dones[t].float()
+            delta = rewards[t] + gamma * next_value * next_is_not_terminal - values[t]
+            next_advantage = delta + gamma * lam * next_is_not_terminal * next_advantage
+            advantages[t] = next_advantage
+            returns[t] = advantages[t] + values[t]
+
+        if torch.isnan(advantages).any() or torch.isinf(advantages).any():
+                print("NaN or Inf detected in advantages")
+                advantages = torch.nan_to_num(advantages, nan=0.0, posinf=1e2, neginf=-1e2)
+        if torch.isnan(returns).any() or torch.isinf(returns).any():
+                print("NaN or Inf detected in advantages")
+                returns = torch.nan_to_num(returns, nan=0.0, posinf=1e2, neginf=-1e2)
+
+        return advantages, returns
+
+    
+
+    def collect_trajectories(self):
+        """
+        Collect trajectories from the environment and ensure `values` is correctly shaped.
+        """
+        next_values = torch.zeros((self.steps_num + 1, self.num_envs), dtype = torch.float32, device = self.device)
+        observations, privilege_observations, raw_actions_lib, rewards, dones, values, log_probs, advantages = [], [], [], [], [], [], [], []
+        
+        mean_recons_loss, mean_kld_loss = 0, 0
+        vae_loss = torch.tensor(0., dtype = torch.float32, device = self.device, requires_grad=True)
+
+        with torch.no_grad():
+            if self.obs_rms is not None:
+                obs_rms = copy.deepcopy(self.obs_rms)
+                privilege_obs_rms = copy.deepcopy(self.privilege_obs_rms)
+                
+            if self.ret_rms is not None:
+                ret_var = self.ret_rms.var.clone()
+
+
+        obs, privilege_obs = self.env.initialize_trajectory()
+
+        if self.obs_rms is not None:
+            # update obs rms
+            with torch.no_grad():
+                self.obs_rms.update(obs)
+                self.privilege_obs_rms.update(privilege_obs)
+            # normalize the current obs
+            obs = obs_rms.normalize(obs)
+            privilege_obs = privilege_obs_rms.normalize(privilege_obs)
+
+
+        for i in range(self.steps_num):
+            with torch.no_grad():
+                obs = torch.nan_to_num(obs, nan=0.0, posinf=1e3, neginf=-1e3)
+                privilege_obs = torch.nan_to_num(privilege_obs, nan=0.0, posinf=1e3, neginf=-1e3)
+                self.obs_buf[i] = obs.clone()
+                self.privilege_obs_buf[i] = privilege_obs.clone()
+
+            # LPF
+            if self.train_LPF:
+                # Add LPF
+                actions, log_prob = self.get_action_and_log_prob(self.actor, obs)
+                actions = torch.tanh(actions)
+                # Apply the LPF (construct a new tensor for filtered actions)
+                filtered_actions = torch.stack([
+                    self.train_r_filter.filter(actions[:, 0]),
+                    self.train_p_filter.filter(actions[:, 1]),
+                    self.train_y_filter.filter(actions[:, 2]),
+                    self.train_thrust_filter.filter(actions[:, 3])
+                ], dim=1)
+                # Continue with the rest of your pipeline
+                vae_output, _ = self.vae.forward(self.obs_hist_buf)
+                obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(filtered_actions, vae_output)
+            else:
+                # No LPF
+                actions, log_prob = self.get_action_and_log_prob(self.actor, obs)
+                vae_output, _ = self.vae.forward(self.obs_hist_buf)
+                obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(torch.tanh(actions), vae_output)
+
+            self.obs_hist_buf = history_obs
+
+            if torch.isnan(rew).any() or torch.isinf(rew).any():
+                print(f"NaN/Inf detected in reward at step {i}: {rew}")
+                rew = torch.nan_to_num(rew, nan=0.0, posinf=1e2, neginf=-1e2)
+
             
+            recons_loss,  kld_loss, vae_loss_grad = self.compute_vae_loss(obs, vel_obs, history_obs, done) 
+            mean_recons_loss += recons_loss
+            mean_kld_loss += kld_loss
+            vae_loss = vae_loss + vae_loss_grad
+
+            with torch.no_grad():
+                raw_rew = rew.clone()
+
+            # Reward scaling
+            rew = rew * self.rew_scale
+
+            if self.obs_rms is not None:
+                # update obs rms
+                with torch.no_grad():
+                    self.obs_rms.update(obs)
+                    self.privilege_obs_rms.update(privilege_obs)
+                # normalize the current obs
+                obs = obs_rms.normalize(obs)
+                privilege_obs = privilege_obs_rms.normalize(privilege_obs)
+
+            if self.ret_rms is not None:
+                # update ret rms
+                with torch.no_grad():
+                    self.ret = self.ret * self.gamma + rew
+                    self.ret_rms.update(self.ret)
+                rew = rew / torch.sqrt(ret_var + 1e-6)
+
+            self.episode_length += 1
+            done_env_ids = done.nonzero(as_tuple = False).squeeze(-1)
+
+
+            # Store data
+            next_values[i + 1] = self.critic(privilege_obs).squeeze(-1)
+            if torch.isnan(next_values[i + 1]).any() or torch.isinf(next_values[i + 1]).any():
+                print(f"NaN/Inf in next_values at step {i}: {next_values[i + 1]}")
+                next_values[i + 1] = torch.nan_to_num(next_values[i + 1], nan=0.0, posinf=1e2, neginf=-1e2)
+            observations.append(obs)
+            privilege_observations.append(privilege_obs)
+            raw_actions_lib.append(actions)
+            rewards.append(rew)
+            dones.append(done)
+            log_probs.append(log_prob)
+            advantages.append(rew)
+
+            for id in done_env_ids:
+                if torch.isnan(extra_info['obs_before_reset'][id]).sum() > 0 \
+                    or torch.isinf(extra_info['obs_before_reset'][id]).sum() > 0 \
+                    or (torch.abs(extra_info['obs_before_reset'][id]) > 1e6).sum() > 0: # ugly fix for nan values
+                    next_values[i + 1, id] = 0.
+                elif self.episode_length[id] < self.max_episode_length: # early termination
+                    next_values[i + 1, id] = 0.
+                else: # otherwise, use terminal value critic to estimate the long-term performance
+                    if self.obs_rms is not None:
+                        real_obs = obs_rms.normalize(extra_info['obs_before_reset'][id])
+                        real_privilege_obs = privilege_obs_rms.normalize(extra_info['privilege_obs_before_reset'][id])
+                    else:
+                        real_obs = extra_info['obs_before_reset'][id]
+                        real_privilege_obs = extra_info['privilege_obs_before_reset'][id]
+                    next_values[i + 1, id] = self.target_critic(real_privilege_obs).squeeze(-1)
             
-            # plane the global ref trajectory
-            traj_wp = self.reward_wp + self.point_could_origin_offset[0].repeat((self.reward_wp.shape[0],1))
-            traj_start = torch.tensor([[-6.0, 0, 1.2]], device=self.device)
-            traj_dest = torch.tensor([[7.0, -2.0, 1.2]], device=self.device)
-            self.ref_traj = self.traj_planner.plan_trajectories(traj_start, traj_dest, [traj_wp])
-            self.ref_traj = torch.tensor(self.ref_traj[0], device = self.device)
-
-         # generate ref_traj
-        if self.map_name == 'gate_right':
-            self.reward_wp = torch.tensor([
-                                        [3.0, -0.8, 1.3],
-                                        [5.8, -1.3, 1.5],
-                                        [7.8, 0.0, 1.0],
-                                        [9.7, 1.4, 0.6],
-                                        [11.8, 0, 1.3],
-                                        [13.0, -2., 1.3]
-                                        ], device=self.device) # (x,y,z)
-            
-            
-            # plane the global ref trajectory
-            traj_wp = self.reward_wp + self.point_could_origin_offset[0].repeat((self.reward_wp.shape[0],1))
-            traj_start = torch.tensor([[-6.0, 0, 1.2]], device=self.device)
-            traj_dest = torch.tensor([[7.0, -2.0, 1.2]], device=self.device)
-            self.ref_traj = self.traj_planner.plan_trajectories(traj_start, traj_dest, [traj_wp])
-            self.ref_traj = torch.tensor(self.ref_traj[0], device = self.device)
-        
-        if self.map_name == 'clutter':
-            self.reward_wp = torch.tensor([
-                              [1.1, -0.6, 1.4],
-                              [6.1, -1.7, 0.6],
-                              [9.4, 1.5, 1.2],
-                              [12.0, -2.3, 1.2]], device=self.device)
-            # plane the global ref trajectory
-            traj_wp = self.reward_wp + self.point_could_origin_offset[0].repeat((self.reward_wp.shape[0],1))
-            traj_start = torch.tensor([[-6.0, 1.0, 1.2]], device=self.device)
-            traj_dest = torch.tensor([[6.0, -2.3, 1.2]], device=self.device)
-            self.ref_traj = self.traj_planner.plan_trajectories(traj_start, traj_dest, [traj_wp])
-            self.ref_traj = torch.tensor(self.ref_traj[0], device = self.device)
-        
-        
-        
-        self.reward_wp_list = [self.reward_wp + self.point_could_origin_offset[0].repeat((self.reward_wp.shape[0],1))] * self.num_envs
-        self.reward_wp_record = []
-        for i in range(self.reward_wp.shape[0]):
-            self.reward_wp_record.append(torch.zeros(self.num_envs, dtype=torch.bool, device=self.device))
-        
-        
-        
-        # Other parameters
-        # original way
-        if self.map_name == 'gate_mid':
-            # ## Original way
-            # self.termination_distance = 1000
-            # self.action_strength = 1.0 # only act on body rate
-            # self.joint_vel_obs_scaling = 0.1
-            self.up_strength = 0.25
-            self.heading_strength = 0.25 # reward yaw motion align with lin_vel
-            self.lin_strength = -1.5
-            self.yaw_strength = 0.0
-            self.action_penalty = -1.0
-            self.action_change_penalty = -1.0
-            self.smooth_penalty = -1.0
-            # self.ang_vel_penalty = -0.4
-            # self.ang_acc_penalty = -0.005
-            self.survive_reward = 8.0
-            self.pose_penalty = -0.5
-            self.height_penalty = -2.0
-            self.height_change_penalty = -0.5
-            self.jitter_penalty = -0.1
-            self.out_map_penalty = -1.5
-            self.map_center_penalty = -0.05
-            # trajectory
-            self.waypoint_strength = 2.0
-            self.target_factor = -2.
-            # obstacle avoidance
-            self.obstacle_strength = 1.0
-            self.collision_penalty_coef = 0.0
-            self.collision_penalty = self.collision_penalty_coef*self.survive_reward 
-        if self.map_name == 'gate_left':
-            # ## Original way
-            # self.termination_distance = 1000
-            # self.action_strength = 1.0 # only act on body rate
-            # self.joint_vel_obs_scaling = 0.1
-            self.up_strength = 0.25
-            self.heading_strength = 0.25 # reward yaw motion align with lin_vel
-            self.lin_strength = -1.5
-            self.yaw_strength = 0.0
-            self.action_penalty = -1.0
-            self.action_change_penalty = -1.0
-            self.smooth_penalty = -1.0
-            # self.ang_vel_penalty = -0.4
-            # self.ang_acc_penalty = -0.005
-            self.survive_reward = 8.0
-            self.pose_penalty = -0.5
-            self.height_penalty = -2.0
-            self.height_change_penalty = -0.5
-            self.jitter_penalty = -0.1
-            self.out_map_penalty = -1.5
-            self.map_center_penalty = -0.05
-            # trajectory
-            self.waypoint_strength = 2.0
-            self.target_factor = -2.
-            # obstacle avoidance
-            self.obstacle_strength = 1.0
-            self.collision_penalty_coef = 0.0
-            self.collision_penalty = self.collision_penalty_coef*self.survive_reward 
-        if self.map_name == 'gate_right':
-            # ## Original way
-            # self.termination_distance = 1000
-            # self.action_strength = 1.0 # only act on body rate
-            # self.joint_vel_obs_scaling = 0.1
-            self.up_strength = 0.25
-            self.heading_strength = 0.25 # reward yaw motion align with lin_vel
-            self.lin_strength = -1.5
-            self.yaw_strength = 0.0
-            self.action_penalty = -1.0
-            self.action_change_penalty = -1.0
-            self.smooth_penalty = -1.0
-            # self.ang_vel_penalty = -0.4
-            # self.ang_acc_penalty = -0.005
-            self.survive_reward = 8.0
-            self.pose_penalty = -0.5
-            self.height_penalty = -2.0
-            self.height_change_penalty = -0.5
-            self.jitter_penalty = -0.1
-            self.out_map_penalty = -1.5
-            self.map_center_penalty = -0.05
-            # trajectory
-            self.waypoint_strength = 2.0
-            self.target_factor = -2.
-            # obstacle avoidance
-            self.obstacle_strength = 1.0
-            self.collision_penalty_coef = 0.0
-            self.collision_penalty = self.collision_penalty_coef*self.survive_reward 
-        if self.map_name == 'cluster':
-            # ## Original way
-            # self.termination_distance = 1000
-            # self.action_strength = 1.0 # only act on body rate
-            # self.joint_vel_obs_scaling = 0.1
-            self.up_strength = 0.25
-            self.heading_strength = 0.25 # reward yaw motion align with lin_vel
-            self.lin_strength = -1.5
-            self.yaw_strength = 0.0
-            self.action_penalty = -1.0
-            self.action_change_penalty = -1.0
-            self.smooth_penalty = -1.0
-            # self.ang_vel_penalty = -0.4
-            # self.ang_acc_penalty = -0.005
-            self.survive_reward = 8.0
-            self.pose_penalty = -0.5
-            self.height_penalty = -2.0
-            self.height_change_penalty = -0.5
-            self.jitter_penalty = -0.1
-            self.out_map_penalty = -1.5
-            self.map_center_penalty = -0.05
-            # trajectory
-            self.waypoint_strength = 2.0
-            self.target_factor = -2.
-            # obstacle avoidance
-            self.obstacle_strength = 1.0
-            self.collision_penalty_coef = 0.0
-            self.collision_penalty = self.collision_penalty_coef*self.survive_reward 
-            
-            
-        # # New way
-        # if self.map_name == 'gate_mid':
-        #     self.up_strength = 0.5  # Increased reward for staying upright
-        #     self.heading_strength = 0.5  # Increased reward for good yaw alignment
-        #     self.lin_strength = 0.5  # Now rewards appropriate linear velocity
-        #     self.yaw_strength = 0.2  # Reward for yaw stability
-        #     self.action_reward = 0.3  # Reward for smaller actions
-        #     self.action_consistency_reward = 0.2  # Reward for consistent actions
-        #     self.survive_reward = 6.0  # Unchanged base survival reward
-        #     self.height_reward = 0.5 # Reward for maintaining target height
-        #     self.height_stability_reward = 0.5  # Reward for stable altitude
-        #     self.smoothness_reward = 0.2  # Reward for smooth operation
-        #     self.in_bounds_reward = 0.5  # Reward for staying within map
-        #     self.map_center_reward = 0.1  # Reward for staying near center
-        #     # Trajectory
-        #     self.waypoint_strength = 0.5  # Increased waypoint reward
-        #     self.target_alignment_factor = 0.2  # Reward for velocity alignment
-        #     # Obstacle avoidance
-        #     self.obstacle_clearance_reward = 0.2  # Reward for keeping distance from obstacles
-        #     self.collision_penalty = -0.5  # Only remaining penalty
-        
-        # if self.map_name == 'gate_left':
-        #     self.up_strength = 0.5  # Increased reward for staying upright
-        #     self.heading_strength = 1.0  # Increased reward for good yaw alignment
-        #     self.lin_strength = 0.5  # Now rewards appropriate linear velocity
-        #     self.yaw_strength = 0.2  # Reward for yaw stability
-        #     self.action_reward = 0.3  # Reward for smaller actions
-        #     self.action_consistency_reward = 0.2  # Reward for consistent actions
-        #     self.survive_reward = 8.0  # Unchanged base survival reward
-        #     self.height_reward = 1.5  # Reward for maintaining target height
-        #     self.height_stability_reward = 0.3  # Reward for stable altitude
-        #     self.smoothness_reward = 0.2  # Reward for smooth operation
-        #     self.in_bounds_reward = 1.0  # Reward for staying within map
-        #     self.map_center_reward = 0.1  # Reward for staying near center
-        #     # Trajectory
-        #     self.waypoint_strength = 3.0  # Increased waypoint reward
-        #     self.target_alignment_factor = 2.0  # Reward for velocity alignment
-        #     # Obstacle avoidance
-        #     self.obstacle_clearance_reward = 1.0  # Reward for keeping distance from obstacles
-        #     self.collision_penalty = -5.0  # Only remaining penalty
-
-        
-        # if self.map_name == 'gate_right':
-        #     self.up_strength = 0.5  # Increased reward for staying upright
-        #     self.heading_strength = 1.0  # Increased reward for good yaw alignment
-        #     self.lin_strength = 0.5  # Now rewards appropriate linear velocity
-        #     self.yaw_strength = 0.2  # Reward for yaw stability
-        #     self.action_reward = 0.3  # Reward for smaller actions
-        #     self.action_consistency_reward = 0.2  # Reward for consistent actions
-        #     self.survive_reward = 8.0  # Unchanged base survival reward
-        #     self.height_reward = 1.5  # Reward for maintaining target height
-        #     self.height_stability_reward = 0.3  # Reward for stable altitude
-        #     self.smoothness_reward = 0.2  # Reward for smooth operation
-        #     self.in_bounds_reward = 1.0  # Reward for staying within map
-        #     self.map_center_reward = 0.1  # Reward for staying near center
-        #     # Trajectory
-        #     self.waypoint_strength = 3.0  # Increased waypoint reward
-        #     self.target_alignment_factor = 2.0  # Reward for velocity alignment
-        #     # Obstacle avoidance
-        #     self.obstacle_clearance_reward = 1.0  # Reward for keeping distance from obstacles
-        #     self.collision_penalty = -5.0  # Only remaining penalty
-        
-        # if self.map_name == 'clutter':
-        #     self.up_strength = 0.5  # Increased reward for staying upright
-        #     self.heading_strength = 1.0  # Increased reward for good yaw alignment
-        #     self.lin_strength = 0.5  # Now rewards appropriate linear velocity
-        #     self.yaw_strength = 0.2  # Reward for yaw stability
-        #     self.action_reward = 0.3  # Reward for smaller actions
-        #     self.action_consistency_reward = 0.2  # Reward for consistent actions
-        #     self.survive_reward = 8.0  # Unchanged base survival reward
-        #     self.height_reward = 1.5  # Reward for maintaining target height
-        #     self.height_stability_reward = 0.3  # Reward for stable altitude
-        #     self.smoothness_reward = 0.2  # Reward for smooth operation
-        #     self.in_bounds_reward = 1.0  # Reward for staying within map
-        #     self.map_center_reward = 0.1  # Reward for staying near center
-        #     # Trajectory
-        #     self.waypoint_strength = 3.0  # Increased waypoint reward
-        #     self.target_alignment_factor = 2.0  # Reward for velocity alignment
-        #     # Obstacle avoidance
-        #     self.obstacle_clearance_reward = 1.0  # Reward for keeping distance from obstacles
-        #     self.collision_penalty = -5.0  # Only remaining penalty
+            if (next_values[i + 1] > 1e6).sum() > 0 or (next_values[i + 1] < -1e6).sum() > 0:
+                print('next value error')
 
 
-        # self.depth_strength = 2.5
-        # self.control_base = 0.327 # hover thrust
-        self.obst_threshold = 0.5
-        self.obst_collision_limit = 0.20
-        self.body_rate_threshold = 15
-        self.domain_randomization = False
+            # collect data for critic training
+            with torch.no_grad():
+                self.rew_buf[i] = torch.clamp(rew.clone(), -1e6, 1e6)
+                if i < self.steps_num - 1:
+                    self.done_mask[i] = done.clone().to(torch.float32)
+                else:
+                    self.done_mask[i, :] = 1.
+                self.next_values[i] = next_values[i + 1].clone()
 
-        
-        # reward function adjusting
-        self.survive_disc_start = 400
-        self.lin_rev_start = 1000
 
-        self.dt = 0.05 # outter loop RL policy freaquency
-        self.map_limit_fact = 1.25
-        self.map_x_min = -1.5; self.map_x_max = 13
-        self.map_y_min = -2.5; self.map_y_max = 2.5
-        
+            # collect episode loss
+            with torch.no_grad():
+                self.episode_loss -= raw_rew
+                self.episode_discounted_loss -= self.episode_gamma * raw_rew
+                self.episode_gamma *= self.gamma
+                if len(done_env_ids) > 0:
+                    self.episode_loss_meter.update(self.episode_loss[done_env_ids])
+                    self.episode_discounted_loss_meter.update(self.episode_discounted_loss[done_env_ids])
+                    self.episode_length_meter.update(self.episode_length[done_env_ids])                    
+                    for done_env_id in done_env_ids:
+                        if (self.episode_loss[done_env_id] > 1e6 or self.episode_loss[done_env_id] < -1e6):
+                            print('ep loss error')
+                            # raise ValueError
 
-        self.nerf_count = 0
-        self.nerf_freq = 1 # inference nerf every # steps
-        self.depth_list = 0
-        self.condition_approach = 4
-        self.training_stage = 0
-
-        self.traj_planning_count = 0
-        
-
-        #-----------------------
-        # Set up visual perception net
-        self.visual_net = VisualPerceptionNet().to(self.device)
-        self.obs_hist_buf = ObsHistBuffer(batch_size=self.num_envs,
-                                          vector_dim=self.num_obs,
-                                          buffer_size=HISTORY_BUFFER_NUM,
-                                          device=self.device,
-                                          )
-
-        # Original way pack for record
-        self.hyper_parameter = {
-            # "termination_distance": self.termination_distance,
-            # "action_strength": self.action_strength,
-            # "joint_vel_obs_scaling": self.joint_vel_obs_scaling,
-            "up_strength": self.up_strength,
-            "heading_strength": self.heading_strength,
-            "lin_strength": self.lin_strength,
-            "obstacle_strength": self.obstacle_strength,
-            "obst_collision_limit": self.obst_collision_limit,
-            "action_penalty": self.action_penalty,
-            "smooth_penalty": self.smooth_penalty,
-            # "target_penalty": self.target_penalty,
-            "target_factor": self.target_factor,
-            "pose_penalty": self.pose_penalty,
-            # "ang_vel_penalty": self.ang_vel_penalty,
-            # "ang_acc_penalty": self.ang_acc_penalty,
-            "obst_threshold": self.obst_threshold,
-            "survive_reward": self.survive_reward,
-            "height_penalty": self.height_penalty,
-            "height_change_penalty": self.height_change_penalty,
-            "sim_dt": self.dt,
-            "collision_penalty": self.collision_penalty,
-            "waypoint_strength": self.waypoint_strength,
-            "jitter_penalty":self.jitter_penalty,
-            "map_center_penalty": self.map_center_penalty,
-            "out_map_penalty": self.out_map_penalty,
-            "collision_penalty_coef":self.collision_penalty_coef,
-            "condition_approach": self.condition_approach,
-            "yaw_strength": self.yaw_strength,
-            "action_change_penalty": self.action_change_penalty,
-        }
-
-        # # # Reward based way pack for record
-        # self.hyper_parameter = {
-        #     # Reward strengths
-        #     "up_strength": self.up_strength,  # Reward for staying upright
-        #     "heading_strength": self.heading_strength,  # Reward for yaw alignment
-        #     "lin_strength": self.lin_strength,  # Reward for linear velocity alignment
-        #     "obstacle_clearance_reward": self.obstacle_clearance_reward,  # Reward for obstacle distance
-        #     "obst_collision_limit": self.obst_collision_limit,  # Distance threshold for collision
-        #     "action_reward": self.action_reward,  # Reward for smaller actions
-        #     "target_alignment_factor": self.target_alignment_factor,  # Reward for velocity alignment
-        #     "obst_threshold": self.obst_threshold,  # Distance threshold for obstacle rewards
-        #     "survive_reward": self.survive_reward,  # Base reward for survival
-        #     "height_reward": self.height_reward,  # Reward for maintaining target height
-        #     "height_stability_reward": self.height_stability_reward,  # Reward for stable altitude
-        #     "sim_dt": self.dt,  # Simulation timestep
-        #     "collision_penalty": self.collision_penalty,  # Only remaining penalty
-        #     "waypoint_strength": self.waypoint_strength,  # Reward for reaching waypoints
-        #     "smoothness_reward": self.smoothness_reward,  # Reward for smooth operation
-        #     "map_center_reward": self.map_center_reward,  # Reward for staying near center
-        #     "in_bounds_reward": self.in_bounds_reward,  # Reward for staying within map
-        #     "condition_approach": self.condition_approach,  # Reset condition strategy
-        #     "yaw_strength": self.yaw_strength,  # Reward for yaw stability
-        #     "action_consistency_reward": self.action_consistency_reward,  # Reward for consistent actions
-        # }
-        
-        #-----------------------
-        # set up Visualization
-        self.time_stamp = get_time_stamp()
-        self.episode_count = 0
-        if (self.visualize):
-            curr_path = os.getcwd()
-            self.save_path = f'{curr_path}/examples/outputs/{self.agent_name}/{self.map_name}/{self.time_stamp}'
-            os.makedirs(self.save_path, exist_ok=True)
+                        self.episode_loss_his.append(self.episode_loss[done_env_id].item())
+                        self.episode_discounted_loss_his.append(self.episode_discounted_loss[done_env_id].item())
+                        self.episode_length_his.append(self.episode_length[done_env_id].item())
+                        self.episode_loss[done_env_id] = 0.
+                        self.episode_discounted_loss[done_env_id] = 0.
+                        self.episode_length[done_env_id] = 0
+                        self.episode_gamma[done_env_id] = 1.
 
            
-        # recored x, y, depth for test
-        self.x_record = []
-        self.y_record = []
-        self.z_record = []
-        self.roll_record = []
-        self.pitch_record = []
-        self.yaw_record = []
-        self.velo_x_record = []
-        self.velo_y_record = []
-        self.velo_z_record = []
-        self.ang_velo_x_record = []
-        self.ang_velo_y_record = []
-        self.ang_velo_z_record = []
-        self.vae_velo_x_record = []
-        self.vae_velo_y_record = []
-        self.vae_velo_z_record = []
-        self.depth_record = []
-        self.img_record = []
-        self.action_record = np.zeros([self.episode_length,4])
-        
 
-    def init_sim(self):
-        # self.builder = df.sim.ModelBuilder()
-        self.builder = ModelBuilder()
-        self.dt = 0.05 # outter loop RL policy freaquency
-        self.sim_dt = self.dt
-        self.ground = True
-
-        self.num_joint_q = 11 # action(4) + position(3) + pose(4)
-        self.num_joint_qd = 10
-
-        self.x_unit_tensor = tu.to_torch([1, 0, 0], dtype=torch.float, device=self.device, requires_grad=False).repeat((self.num_envs, 1))
-        self.y_unit_tensor = tu.to_torch([0, 1, 0], dtype=torch.float, device=self.device, requires_grad=False).repeat((self.num_envs, 1))
-        self.z_unit_tensor = tu.to_torch([0, 0, 1], dtype=torch.float, device=self.device, requires_grad=False).repeat((self.num_envs, 1))
-
-        if self.map_name == 'gate_mid':
-            self.start_rot = np.array([0., 0., 0., 1.]) # (x,y,z,w)
-        if self.map_name == 'gate_left':
-            self.start_rot = np.array([0., 0., 0., 1.]) # (x,y,z,w)
-        if self.map_name == 'gate_right':
-            self.start_rot = np.array([0., 0., 0., 1.]) # (x,y,z,w)
-        if self.map_name == 'clutter':
-            # self.start_rot = np.array([0., 0., 0.707, 0.707]) # (x,y,z,w), rpy (0,0,pi/2)
-            self.start_rot = np.array([0.0, 0.0, 0.382683, 0.923879]) # (x,y,z,w), rpy (0,0,pi/4)
-
-        self.start_rotation = tu.to_torch(self.start_rot, device=self.device, requires_grad=False)
-
-        # initialize some data used later on
-        # todo - switch to z-up
-        self.up_vec = self.z_unit_tensor.clone()
-        self.heading_vec = self.x_unit_tensor.clone()
-        self.inv_start_rot = tu.quat_conjugate(self.start_rotation).repeat((self.num_envs, 1))
-
-        # self.basis_vec0 = self.heading_vec.clone()
-        # self.basis_vec1 = self.up_vec.clone()
-
-        self.mass = torch.ones(self.num_envs, device=self.device)*1.2  # All drones have mass = 1.2 kg
-        self.max_thrust = torch.full((self.num_envs,), 27.0, device=self.device)  # All drones have max_thrust = 27 N
-        self.hover_thrust = self.mass * 9.81  # Hover thrust for each drone
-        inertia = torch.tensor([0.02, 0.02, 0.04], device=self.device)  # Diagonal inertia components
-        self.inertia = torch.diag(inertia).unsqueeze(0).repeat(self.num_envs, 1, 1)  # Repeat for all drones
-        link_length = 0.15  # meters
-        Kp = torch.tensor([2.9, 2.45, 3.5], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)  # Repeat for all drones
-        Kd = torch.tensor([0.003, 0.0025, 0.0025], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)  # Repeat for all drones
-
-        # Initialize the QuadrotorSimulator
-        self.quad_dynamics = QuadrotorSimulator(
-            mass=self.mass,  # Shape: (batch_size,)
-            inertia=self.inertia,  # Shape: (batch_size, 3, 3)
-            link_length=link_length,  # Scalar
-            Kp=Kp,  # Shape: (batch_size, 3)
-            Kd=Kd,  # Shape: (batch_size, 3)
-            freq=200.0,  # Scalar
-            max_thrust=self.max_thrust,  # Shape: (batch_size,)
-            total_time=self.sim_dt,  # Scalar
-            rotor_noise_std=0.025,  # Scalar
-            br_noise_std=0.025  # Scalar
-        )
-        
-        if self.map_name == 'gate_mid':
-            # start_pos_x = -0.5; start_pos_y = 0.5
-            # start_pos_x = -1.0; start_pos_y = -1.0
-            start_pos_x = 0.0; start_pos_y = 0.0
-            self.start_body_rate = [0., 0., 0.]
-        if self.map_name == 'gate_left':
-            start_pos_x = 0.0; start_pos_y = 0.0
-            self.start_body_rate = [0., 0., 0.]
-        if self.map_name == 'gate_right':
-            start_pos_x = 0.0; start_pos_y = 0.0
-            self.start_body_rate = [0., 0., 0.]
-        if self.map_name == 'clutter':
-            start_pos_x = -0.5; start_pos_y = 1.0
-            self.start_body_rate = [0., 0., 0.]
-
-        self.start_height = 1.2
-        self.start_pos = []
-        # self.start_body_rate = [0., 0., 0.] # r,p,y
-        self.start_norm_thrust = [(self.hover_thrust / self.max_thrust).clone().detach().cpu().numpy()[0]]
-        self.control_base = self.start_norm_thrust[0]
-        self.start_action = self.start_body_rate + self.start_norm_thrust
-        
-        
-        # if self.visualize:
-        #     self.env_dist = 2.5
-        # else:
-        #     self.env_dist = 0. # set to zero for training for numerical consistency
-        
-
-        for i in range(self.num_environments):
-            # start_pos_y = i*self.env_dist
-            start_pos = [start_pos_x, start_pos_y, self.start_height, ]
-            self.start_pos.append(start_pos)
-
-        # start_x variables for reseting drones       
-        self.start_pos = tu.to_torch(self.start_pos, device=self.device)
-        self.start_pos_backup = self.start_pos.clone()
-        self.start_joint_q = tu.to_torch(self.start_action, device=self.device)
-        self.start_joint_target = tu.to_torch(self.start_action, device=self.device)
-        self.prev_thrust = torch.ones([self.num_envs, 1], device=self.device) * (self.hover_thrust / self.max_thrust)
-        
-        # initialize action with hover thrust
-        self.actions = self.start_joint_q.repeat(self.num_envs,1).clone()
-        self.prev_actions = self.actions.clone()
-        # initialize state variables
-        self.state_joint_q = torch.zeros([self.num_envs, 7], device=self.device) # pos + quat
-        self.state_joint_qd = torch.zeros([self.num_envs, 6], device=self.device) # lin_velo + ang_velo
-        self.state_joint_qdd = torch.zeros([self.num_envs, 6], device=self.device) # lin_acc + ang_acc
-        
-        self.latent_vect = torch.zeros([self.num_envs, LATENT_VECT_NUM], device=self.device, dtype = torch.float)
-        self.lin_vel_vae = torch.zeros([self.num_envs, 3], device=self.device, dtype = torch.float)
-
-    
-    # def step(self, actions):
-    def step(self, actions, vae_info, vel_net_info):
-        self.latent_vect, _ = vae_info[0].clone().detach(), vae_info[1].clone().detach()
-        self.lin_vel_vae = vel_net_info[0].clone().detach()
-
-        # prepare vae data
-        self.obs_hist_buf.update(self.obs_buf)
-        obs_hist = self.obs_hist_buf.get_concatenated().clone().detach()
-        obs_vel = self.privilege_obs_buf[:, 3:6].clone().detach()
-
-        actions = actions.view((self.num_envs, self.num_actions))
-        body_rate_cols = torch.clip(actions[:, 0:3], -1., 1.)
-        # thrust_col = torch.clip(actions[:, 3:],-1., 1.) * 0.2 + self.control_base
-        # thrust_col = torch.clip(actions[:, 3:],-1., 1.) * 0.2 + self.control_base
-        thrust_col = (torch.clip(actions[:, 3:],-1., 1.) + 1) * 0.25 # 0 to 0.5
-
-        actions = torch.cat([body_rate_cols, thrust_col], dim=1)
-        self.prev_actions = self.actions.clone()
-        
-        # # test direction of rpy
-        # actions = torch.zeros_like(actions)
-        # actions[:, 3] = 0.4
-        # # actions[:, 0] = 0.25 # positive roll
-        # actions[:, 1] = -0.25 # positive yaw
-        # # actions[:, 2] = 0.25 # positive yaw
-
-        self.actions = actions # normalized
-        control_input = (actions[:, 0:3], actions[:, 3])
-        
-        torso_pos = self.state_joint_q.view(self.num_envs, -1)[:, 0:3] # (x, y, z)
-        torso_quat = self.state_joint_q.view(self.num_envs, -1)[:, 3:7] # rotated 90 deg
-        lin_vel = self.state_joint_qd.view(self.num_envs, -1)[:, 3:6] # joint_qd rot has 3 entries
-        ang_vel = self.state_joint_qd.view(self.num_envs, -1)[:, 0:3]
-        lin_acc = self.state_joint_qdd.view(self.num_envs, -1)[:, 3:6] # joint_qd rot has 3 entries
-        ang_acc = self.state_joint_qdd.view(self.num_envs, -1)[:, 0:3]
-        # torso_quat = tu.quat_mul(torso_rot, self.inv_start_rot)
-
-        # if self.episode_count > 70:
-        #     print(self.episode_count)
-
-        self.time_report.start_timer("dynamic simulation")
-        new_position, new_linear_velocity, new_angular_velocity, new_quaternion, new_linear_acceleration, new_angular_acceleration = self.quad_dynamics.run_simulation(
-        position=torso_pos,
-        velocity=lin_vel,
-        orientation=torso_quat[:, [3,0,1,2]],
-        angular_velocity=ang_vel,
-        control_input=control_input
-    )
-        self.time_report.end_timer("dynamic simulation")
-        # set new state back
-        if self.no_grad:
-            new_position = new_position.detach()
-            new_quaternion = new_quaternion.detach()
-            new_linear_velocity = new_linear_velocity.detach()
-            new_angular_velocity = new_angular_velocity.detach()
-            
-
-        self.state_joint_q.view(self.num_envs, -1)[:, 0:3] = new_position
-        self.state_joint_q.view(self.num_envs, -1)[:, 3:7] = new_quaternion[:, [1,2,3,0]].clone()
-        self.state_joint_qd.view(self.num_envs, -1)[:, 3:6] = new_linear_velocity
-        self.state_joint_qd.view(self.num_envs, -1)[:, 0:3] = new_angular_velocity
-        self.state_joint_qdd.view(self.num_envs, -1)[:, 3:6] = new_linear_acceleration.clone().detach()
-        self.state_joint_qdd.view(self.num_envs, -1)[:, 0:3] = new_angular_acceleration.clone().detach()
-        # joint_qdd = self.state_joint_qdd.view(self.num_envs, -1).clone()  # Clone the tensor to avoid in-place operation
-        # joint_qdd[:, 3:6] = new_linear_acceleration
-        # joint_qdd[:, 0:3] = new_angular_acceleration
-        # self.state_joint_qdd = joint_qdd.view_as(self.state_joint_qdd)  # Assign it back
-
-        self.sim_time += self.sim_dt
-        self.reset_buf = torch.zeros_like(self.reset_buf)
-
-        self.progress_buf += 1
-        self.num_frames += 1
-
-        self.calculateObservations()
-        self.calculateReward()
-
-        env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
-
-        if self.no_grad == False:
-            self.obs_buf_before_reset = self.obs_buf.clone()
-            self.privilege_obs_buf_before_reset = self.privilege_obs_buf.clone()
-            self.extras = {
-                'obs_before_reset': self.obs_buf_before_reset,
-                'privilege_obs_before_reset': self.privilege_obs_buf_before_reset,
-                'episode_end': self.termination_buf,
-                }
-
-        if len(env_ids) > 0:
-           self.reset(env_ids)
-
-        # self.render()
-        if (torch.isnan(obs_hist).any() | torch.isinf(obs_hist).any()):
-            print('obs hist nan')
-            obs_hist = torch.nan_to_num(obs_hist, nan=0.0, posinf=1e3, neginf=-1e3)
-        if (torch.isnan(obs_vel).any() | torch.isinf(obs_vel).any()):
-            print('obs vel nan')
-            obs_vel = torch.nan_to_num(obs_vel, nan=0.0, posinf=1e3, neginf=-1e3)
-        
-
-        return self.obs_buf, self.privilege_obs_buf, obs_hist, obs_vel, self.rew_buf, self.reset_buf, self.extras
-    
-    def change_curriculum(self, type):
-        if type == 0:
-            self.start_pos = self.start_pos_backup.clone()
-        elif type == 1:
-            self.start_pos = self.reward_wp[0].repeat(self.num_envs,1)
-            return self.start_pos[0]
-        elif type == 2:
-            self.start_pos = self.reward_wp[1].repeat(self.num_envs,1)
-            return self.start_pos[0]
-        elif type == 3:
-            self.start_rot = quat_from_axis_angle((0.707, -0.707, 0.0), -math.pi*0.5)
-            self.start_rotation = tu.to_torch(self.start_rot, device=self.device, requires_grad=False)
-            return self.start_rotation
-
-    def reset(self, env_ids = None, force_reset = True):
-        if env_ids is None:
-            if force_reset == True:
-                env_ids = torch.arange(self.num_envs, dtype=torch.long, device=self.device)
-
-        if env_ids is not None:
-            if not self.visualize and self.domain_randomization:
-                # self.mass = random.uniform(0.8,1.2)
-                # self.max_thrust = random.uniform(17,28) # randomized max_thrust
-                num_reset_envs = len(env_ids)
-                mass_noise = torch.rand(num_reset_envs, device=self.device) * 0.2 + 1.1  # Uniform noise between 1.1 and 1.3
-                self.mass[env_ids] = mass_noise
-                max_thrust_noise = torch.rand(num_reset_envs, device=self.device) * 2.0 + 26.0  # Uniform noise between 26 and 28
-                self.max_thrust[env_ids] = max_thrust_noise
-                inertia = torch.tensor([0.02, 0.02, 0.04], device=self.device)  # Base inertia
-                inertial_noise = (torch.rand(num_reset_envs, 3, device=self.device) - 0.5) * 2 * 0.2 * inertia  # ±20% noise
-                randomized_inertia = inertia + inertial_noise
-                self.inertia[env_ids] = torch.diag_embed(randomized_inertia)  # Shape: (num_reset_envs, 3, 3)
-                self.hover_thrust[env_ids] = self.mass[env_ids] * 9.81
-
-                # Reinitialize QuadrotorSimulator with updated parameters
-                self.quad_dynamics = QuadrotorSimulator(
-                    mass=self.mass,  # Shape: (batch_size,)
-                    inertia=self.inertia,  # Shape: (batch_size, 3, 3)
-                    link_length=0.15,  # Scalar
-                    Kp=torch.tensor([2.9, 2.45, 3.5], device=self.device).unsqueeze(0).repeat(self.num_envs, 1),  # Shape: (batch_size, 3)
-                    Kd=torch.tensor([0.003, 0.0025, 0.0025], device=self.device).unsqueeze(0).repeat(self.num_envs, 1),  # Shape: (batch_size, 3)
-                    freq=200.0,  # Scalar
-                    max_thrust=self.max_thrust,  # Shape: (batch_size,)
-                    total_time=self.sim_dt,  # Scalar
-                    rotor_noise_std=0.025,  # Scalar
-                    br_noise_std=0.025  # Scalar
-                )
-                
-
-                self.start_norm_thrust = [(self.hover_thrust / self.max_thrust).clone().detach().cpu().numpy()[0]]
-                self.control_base = self.start_norm_thrust[0]
-                self.start_action = self.start_body_rate + self.start_norm_thrust
-                self.start_joint_q = tu.to_torch(self.start_action, device=self.device)
-            
-            # clone the state to avoid gradient error
-            self.state_joint_q = self.state_joint_q.clone()
-            self.state_joint_qd = self.state_joint_qd.clone()
-            self.state_joint_qdd = self.state_joint_qdd.clone()
-
-            # fixed start state
-            self.state_joint_q[env_ids, 0:3] = self.start_pos[env_ids, :].clone()
-            self.state_joint_q.view(self.num_envs, -1)[env_ids, 3:7] = self.start_rotation.clone()
-            # self.state_joint_q.view(self.num_envs, -1)[env_ids, 7:] = self.start_joint_q.clone()
-            self.state_joint_qd.view(self.num_envs, -1)[env_ids, :] = 0.
-            self.state_joint_qdd.view(self.num_envs, -1)[env_ids, :] = 0.
-            self.actions.view(self.num_envs, -1)[env_ids, :] = self.start_joint_q.clone()
-            self.prev_actions.view(self.num_envs, -1)[env_ids, :] = self.start_joint_q.clone()
-
-            # randomization
-            if not self.visualize and self.stochastic_init:
-                self.state_joint_q.view(self.num_envs, -1)[env_ids, 0:3] = self.state_joint_q.view(self.num_envs, -1)[env_ids, 0:3] + 0.5 * (torch.rand(size=(len(env_ids), 3), device=self.device) - 0.5) * 2.
-                angle = (torch.rand(len(env_ids), device = self.device) - 0.5) * np.pi / 12.
-                axis = torch.nn.functional.normalize(torch.rand((len(env_ids), 3), device = self.device) - 0.5)
-                self.state_joint_q.view(self.num_envs, -1)[env_ids, 3:7] = tu.quat_mul(self.state_joint_q.view(self.num_envs, -1)[env_ids, 3:7], tu.quat_from_angle_axis(angle, axis))
-                # self.state_joint_q.view(self.num_envs, -1)[env_ids, 7:] = self.state_joint_q.view(self.num_envs, -1)[env_ids, 7:] + 0.2 * (torch.rand(size=(len(env_ids), self.num_joint_q - 7), device = self.device) - 0.5) * 2.
-                self.state_joint_qd.view(self.num_envs, -1)[env_ids, :] = 0.5 * (torch.rand(size=(len(env_ids), 6), device=self.device) - 0.5)
-                self.state_joint_qdd.view(self.num_envs, -1)[env_ids, :] = 0.05 * (torch.rand(size=(len(env_ids), 6), device=self.device) - 0.5)
-                self.actions.view(self.num_envs, -1)[env_ids, :] = self.start_joint_q.clone() + 0.05 * (torch.rand(size=(len(env_ids), 4), device=self.device))
-                self.prev_actions.view(self.num_envs, -1)[env_ids, :] = self.start_joint_q.clone()
-            
-            
-
-            # clear action
-            # self.actions = self.actions.clone()
-            # self.actions[env_ids, :] = torch.zeros((len(env_ids), self.num_actions), device = self.device, dtype = torch.float)
-            # self.prev_actions = self.prev_actions.clone()
-            # self.prev_actions[env_ids, :] = torch.zeros((len(env_ids), self.num_actions), device = self.device, dtype = torch.float)
-
-            # clear VAE variables
-            self.latent_vect = torch.zeros([self.num_envs, LATENT_VECT_NUM], device=self.device, dtype = torch.float)
-            self.lin_vel_vae = torch.zeros([self.num_envs, 3], device=self.device, dtype = torch.float)
-
-            self.progress_buf[env_ids] = 0
-            self.calculateObservations()
-
-        return self.obs_buf
-    
-    '''
-    cut off the gradient from the current state to previous states
-    '''
-    def clear_grad(self, checkpoint = None):
-        with torch.no_grad():
-            if checkpoint is None:
-                checkpoint = {}
-                checkpoint['joint_q'] = self.state_joint_q.clone()
-                checkpoint['joint_qd'] = self.state_joint_qd.clone()
-                checkpoint['actions'] = self.actions.clone()
-                checkpoint['prev_actions'] = self.prev_actions.clone()
-                checkpoint['progress_buf'] = self.progress_buf.clone()
-                checkpoint['latent_vect'] = self.latent_vect.clone()
-                checkpoint['lin_vel_vae'] = self.lin_vel_vae.clone()
-
-            current_joint_q = checkpoint['joint_q'].clone()
-            current_joint_qd = checkpoint['joint_qd'].clone()
-            # self.state = self.model.state()
-            self.state_joint_q = current_joint_q
-            self.state_joint_qd = current_joint_qd
-            self.actions = checkpoint['actions'].clone()
-            self.prev_actions = checkpoint['prev_actions'].clone()
-            self.progress_buf = checkpoint['progress_buf'].clone()
-            self.latent_vect = checkpoint['latent_vect'].clone()
-            self.lin_vel_vae = checkpoint['lin_vel_vae'].clone()
-
-    '''
-    This function starts collecting a new trajectory from the current states but cuts off the computation graph to the previous states.
-    It has to be called every time the algorithm starts an episode and it returns the observation vectors
-    '''
-    def initialize_trajectory(self):
-        self.clear_grad()
-        self.calculateObservations()
-
-        return self.obs_buf, self.privilege_obs_buf
-
-    def get_checkpoint(self):
-        checkpoint = {}
-        checkpoint['joint_q'] = self.state_joint_q.clone()
-        checkpoint['joint_qd'] = self.state_joint_qd.clone()
-        checkpoint['actions'] = self.actions.clone()
-        checkpoint['prev_actions'] = self.prev_actions.clone()
-        checkpoint['progress_buf'] = self.progress_buf.clone()
-        checkpoint['latent_vect'] = self.latent_vect.clone()
-        checkpoint['lin_vel_vae'] = self.lin_vel_vae.clone()
-
-        return checkpoint
-    
-    def process_GS_data(self, depth_list, nerf_img):
-        # min depth from nerf
-        batch,H,W,ch = depth_list.shape
-        depth_list_up = depth_list[:,0:int(H/2),:,:]
-        self.depth_list = torch.abs(torch.amin(depth_list_up,dim=(1,2,3))) 
-        self.depth_list = self.depth_list.unsqueeze(1)
-        self.depth_list = self.depth_list.to(device=self.device)
-        # rgb from nerf
-        input_tensor = nerf_img.permute(0, 3, 1, 2)
-        depth_tensor = depth_list.permute(0, 3, 1, 2)  # Make sure depth_list is [batch_size, channels, height, width]
-        # Concatenate RGB image and depth data along the channel dimension
-        combined_tensor = torch.cat([input_tensor, depth_tensor], dim=1)
-        # Resize to match ResNet18 input size
-        resize = nn.AdaptiveAvgPool2d((224, 224))
-        combined_tensor = resize(combined_tensor)
-        combined_tensor = combined_tensor.to(self.device)
-        self.visual_info = self.visual_net(combined_tensor)
-        self.visual_info = self.visual_info.detach()
-        
-
-
-    def calculateObservations(self):
-        torso_pos = self.state_joint_q.view(self.num_envs, -1)[:, 0:3]
-        torso_quat = self.state_joint_q.view(self.num_envs, -1)[:, 3:7] # (x,y,z,w)
-        lin_vel = self.state_joint_qd.view(self.num_envs, -1)[:, 3:6] # joint_qd rot has 3 entries
-        ang_vel = self.state_joint_qd.view(self.num_envs, -1)[:, 0:3]
-
-        # convert the linear velocity of the torso from twist representation to the velocity of the center of mass in world frame
-        lin_vel_new = lin_vel - torch.cross(torso_pos, ang_vel, dim=-1).detach().clone()
-        # lin_vel = torch.clamp(lin_vel.clone(), min=-1e6, max=1e6)
-        # self.lin_vel_vae = torch.clamp(self.lin_vel_vae.clone(), min=-1e6, max=1e6)
-
-        to_target =  + self.start_pos - torso_pos
-        to_target[:, 2] = 0.0
-        
-        # target_dirs = tu.normalize(to_target)
-        target_dirs = tu.normalize(lin_vel[:, 0:2].clone())
-        up_vec = tu.quat_rotate(torso_quat.clone(), self.up_vec)
-        up_vec_ablation = torch.zeros_like(up_vec)
-        # heading_vec = tu.quat_rotate(torso_quat, self.heading_vec)
-        rpy = quaternion_to_euler(torso_quat[:, [3,0,2,1]]) # input is (w,x,z,y)
-        heading_vec = torch.cat([torch.cos(rpy[:,2].unsqueeze(-1)), torch.sin(rpy[:,2].unsqueeze(-1))], dim=1) 
-
-        # Parallized implementation
-        # gs_quat = torso_quat # (x, y, z, w)
-        gs_pos = torso_pos + self.gs_origin_offset # (x, y, z)
-        gs_pos[:, 1] = -gs_pos[:, 1]
-        gs_pos[:, 2] = -gs_pos[:, 2]
-        gs_pose = torch.cat([gs_pos, torch.zeros([self.num_envs, 3], device = self.device), torso_quat], dim=-1)
-        rpy_data = rpy.clone().detach().cpu().numpy()
-
-
-        if not self.visualize:
-            # Nerf info processing
-            if self.nerf_count % self.nerf_freq == 0: # infer nerf every nerf_freq steps
-                self.time_report.start_timer("3D GS inference")
-                depth_list, nerf_img = self.gs.render(gs_pose) # (batch_size,H,W,1/3)
-                self.process_GS_data(depth_list, nerf_img)
-                self.time_report.end_timer("3D GS inference")
-            self.nerf_count += 1            
-            
-        # Draw record plot for data visualization
-        if self.visualize:
-            img_transform = Resize((360, 640), antialias=True)
-
-            # ---------------------------------------
-            # Normal test mode
-            # NeRF data
-            depth_list, nerf_img = self.gs.render(gs_pose) # (batch_size,H,W,1/3)
-            self.process_GS_data(depth_list, nerf_img)
-
-            # Visualization
-            # rgb from nerf
-            nerf_img = torch.permute(nerf_img[0], (2,0,1))
-            img = img_transform(nerf_img)
-
-            pos_data = torso_pos.clone()
-            pos_data = pos_data.detach().cpu().numpy()
-            depth_data = self.depth_list.clone()
-            depth_data = depth_data.detach().cpu().numpy()
-            action_data = self.actions.clone().detach().cpu().numpy()
-            ang_vel_data = ang_vel.clone().detach().cpu().numpy()
-            # velo_data = lin_vel_new.clone().detach().cpu().numpy()
-            vae_velo_data = self.lin_vel_vae.clone().detach().cpu().numpy()
-            velo_data = lin_vel.clone().detach().cpu().numpy()
-
-            self.x_record.append(pos_data[0, 0])
-            self.y_record.append(pos_data[0, 1])
-            self.z_record.append(pos_data[0, 2])
-            self.roll_record.append(rpy_data[0, 0])
-            self.pitch_record.append(rpy_data[0, 1])
-            self.yaw_record.append(rpy_data[0, 2])
-            self.velo_x_record.append(velo_data[0, 0])
-            self.velo_y_record.append(velo_data[0, 1])
-            self.velo_z_record.append(velo_data[0, 2])
-            self.ang_velo_x_record.append(ang_vel_data[0, 0])
-            self.ang_velo_y_record.append(ang_vel_data[0, 1])
-            self.ang_velo_z_record.append(ang_vel_data[0, 2])
-            self.vae_velo_x_record.append(vae_velo_data[0, 0])
-            self.vae_velo_y_record.append(vae_velo_data[0, 1])
-            self.vae_velo_z_record.append(vae_velo_data[0, 2])
-            self.depth_record.append(depth_data[0]/2)
-            self.img_record.append(img)
-            if self.episode_count < self.episode_length:
-                self.action_record[self.episode_count,:] = action_data
-            self.episode_count += 1
-
-        
-        self.latent_abalation = torch.zeros_like(self.latent_vect)
-        torso_rot_ablation = torch.zeros_like(torso_quat)
-        ang_vel_ablation = torch.zeros_like(ang_vel)
-        lin_acceleration = self.state_joint_qdd.view(self.num_envs, -1)[:, 3:6]
-        ang_acceleration = self.state_joint_qdd.view(self.num_envs, -1)[:, 0:3]
-        torso_pos_ablation = torch.zeros_like(torso_pos)
-        self.privilege_obs_buf = torch.cat([
-                                torso_pos[:, :], # 0:3 
-                                # lin_vel_new, # 3:6
-                                lin_vel,
-                                lin_acceleration, # acc 6:9 
-                                torso_quat, # 9:13
-                                ang_vel, # 13:16
-                                # up_vec[:, 1:2], # 16
-                                up_vec_ablation[:, 1:2],
-                                (heading_vec * target_dirs).sum(dim = -1).unsqueeze(-1), # 17
-                                self.actions, # 18:22
-                                self.prev_actions, # 22:26
-                                self.depth_list, # 26
-                                self.visual_info, # 27:51
-                                # self.latent_abalation
-                                self.latent_vect, # 51:67
-                                # ang_acceleration, # 59:62
-                                self.lin_vel_vae,
-                                ], 
-                                dim = -1)
-        
-        # adding noise
-        torso_pos_noise = 0.1 * (torch.rand_like(torso_pos)-0.5)
-        lin_vel_noise = 0.1 * (torch.rand_like(lin_vel) - 0.5)
-        visual_noise = 0.1 * (torch.rand_like(self.visual_info) - 0.5)
-        torso_quat_noise = 0.1 * (torch.rand_like(torso_quat) - 0.5)
-        if self.training_stage == 0:
-            # # add noise
-            self.obs_buf = torch.cat([
-                                    (torso_pos[:, 2]+torso_pos_noise[:, 2]).unsqueeze(-1), # z-pos 0
-                                    # torso_pos_ablation[:, 2].unsqueeze(-1), # z-pos 0
-
-                                    # lin_vel_new[:, 2].unsqueeze(-1), # z-vel 1
-                                    (lin_vel[:, 2]+lin_vel_noise[:, 2]).unsqueeze(-1),
-
-                                    # lin_acceleration[:, 2].unsqueeze(-1), # z-acc 2
-                                    torso_pos_ablation[:, 2].unsqueeze(-1),
-
-                                    torso_quat+torso_quat_noise, # 3:7
-                                    # torso_rot_ablation,
-
-                                    # ang_vel, # 7:10
-                                    ang_vel_ablation,
-
-                                    # up_vec[:, 1:2], # 10
-                                    up_vec_ablation[:, 1:2],
-
-                                    self.actions, # 11:15
-                                    self.prev_actions, # 15:19
-                                    # self.lin_vel_vae, # 19:22
-                                    lin_vel,
-                                    self.visual_info+visual_noise, # 22:46
-                                    # self.latent_abalation
-                                    self.latent_vect, # 46:62
-                                    ], 
-                                    dim = -1)
-            
-            # # noise-free version
-            # self.obs_buf = torch.cat([
-            #                         (torso_pos[:, 2]).unsqueeze(-1), # z-pos 0
-            #                         # torso_pos_ablation[:, 2].unsqueeze(-1), # z-pos 0
-
-            #                         # lin_vel_new[:, 2].unsqueeze(-1), # z-vel 1
-            #                         (lin_vel[:, 2]).unsqueeze(-1),
-
-            #                         # lin_acceleration[:, 2].unsqueeze(-1), # z-acc 2
-            #                         torso_pos_ablation[:, 2].unsqueeze(-1),
-
-            #                         torso_quat+torso_quat_noise, # 3:7
-            #                         # torso_rot_ablation,
-
-            #                         # ang_vel, # 7:10
-            #                         ang_vel_ablation,
-
-            #                         # up_vec[:, 1:2], # 10
-            #                         up_vec_ablation[:, 1:2],
-
-            #                         self.actions, # 11:15
-            #                         self.prev_actions, # 15:19
-            #                         # self.lin_vel_vae, # 19:22
-            #                         lin_vel,
-            #                         self.visual_info, # 22:46
-            #                         # self.latent_abalation
-            #                         self.latent_vect, # 46:62
-            #                         ], 
-            #                         dim = -1)
+        # Convert lists to tensors
+        observations = torch.stack(observations)
+        privilege_observations = torch.stack(privilege_observations)
+        raw_actions_lib = torch.stack(raw_actions_lib)
+        rewards = torch.stack(rewards)
+        dones = torch.stack(dones)
+        log_probs = torch.stack(log_probs)
+        advantages = torch.stack(advantages)
+
+        # Normalize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # Process VAE loss
+        mean_recons_loss /= self.steps_num
+        mean_kld_loss /= self.steps_num
+        vae_loss = vae_loss / self.steps_num
+        self.vae_loss = mean_recons_loss + self.kl_weight * mean_kld_loss
+
+        return {
+            "observations": observations,
+            "privilege_observations": privilege_observations,
+            "actions": raw_actions_lib,
+            "rewards": rewards,
+            "dones": dones,
+            "values": next_values,
+            "log_probs": log_probs,
+            "advantages": advantages,
+            "vae_loss": vae_loss,
+        }
+
+
+    def get_action_and_log_prob(self, actor, obs, deterministic=False):
+        mean = actor(obs)  
+        log_std = actor.get_logstd()
+        log_std = log_std.clamp(-20, 2)
+        std = log_std.exp()
+        dist_policy = dist.Normal(mean, std)
+
+        if deterministic:
+            actions = mean
         else:
-            self.obs_buf = torch.cat([
-                                    torso_pos[:, 2].unsqueeze(-1), # z-pos 0
-                                    # lin_vel_new[:, 2].unsqueeze(-1), # z-vel 1
-                                    lin_vel[:, 2].unsqueeze(-1),
-                                    lin_acceleration[:, 2].unsqueeze(-1), # z-acc 2
-                                    torso_quat, # 3:7
-                                    # torso_rot_ablation,
-                                    ang_vel, # 7:10
-                                    # up_vec[:, 1:2], # 10
-                                    up_vec_ablation[:, 1:2],
-                                    self.actions, # 11:15
-                                    self.prev_actions, # 15:19
-                                    self.lin_vel_vae, # 19:22
-                                    # lin_vel,
-                                    self.visual_info, # 22:46
-                                    # self.latent_abalation
-                                    self.latent_vect, # 46:62
-                                    ], 
-                                    dim = -1)
-        
-        # ugly fix of simulation (usually z_acc inf) 
-        if (torch.isnan(self.obs_buf).any() | torch.isinf(self.obs_buf).any()):
-            print('nan')
-            self.obs_buf = torch.nan_to_num(self.obs_buf, nan=0.0, posinf=1e2, neginf=-1e2)
+            actions = dist_policy.rsample()
 
-        if (torch.isnan(self.privilege_obs_buf).any() | torch.isinf(self.privilege_obs_buf).any()):
-            print('nan')
-            self.privilege_obs_buf = torch.nan_to_num(self.privilege_obs_buf, nan=0.0, posinf=1e2, neginf=-1e2)
-
-        # # ## used for adding breakpoint
-        # print(self.episode_count)
-        # if self.episode_count % 40 == 0:
-        #     print(self.episode_count)
-
-    def calculateReward(self):
-        # torso_pos = self.state_joint_q.view(self.num_envs, -1)[:, 0:3]
-        # torso_rot = self.state_joint_q.view(self.num_envs, -1)[:, 3:7]
-        torso_pos = self.privilege_obs_buf[:, 0:3]
-        # torso_rot = self.obs_buf[:, 3:7]
-        torso_quat = self.obs_buf[:, 3:7] # (x,y,z,w)
-        drone_rot = torso_quat # (x, y, z, w)
-        drone_pos = torso_pos + self.point_could_origin_offset # in point cloud dimension
-        drone_target = self.target + self.point_could_origin_offset
-
-        # make yaw angle align with velocity
-        target_dirs = tu.normalize(self.privilege_obs_buf[:, [3,5]])
-        rpy = rpy = quaternion_to_euler(torso_quat[:, [3,0,2,1]]) # input is (w,x,z,y)
-        heading_vec = torch.cat([torch.cos(rpy[:,2].unsqueeze(-1)), torch.sin(rpy[:,2].unsqueeze(-1))], dim=1) 
-        yaw_alignment = (heading_vec * target_dirs).sum(dim = -1)
-
-        # Compute ref_x for all environments
-        ref_x = self.privilege_obs_buf[:, 0] + self.point_could_origin_offset[0, 0]  # Shape: [num_envs]
-        ref_traj_x = self.ref_traj[:, 0]  # Shape: [ref_traj_length]
-        diff = ref_traj_x.unsqueeze(0) - ref_x.unsqueeze(1)  # Shape: [num_envs, ref_traj_length]
-        mask = diff > 0.5  # Shape: [num_envs, ref_traj_length]
-        diff_masked = torch.where(mask, diff, float('inf'))  # Shape: [num_envs, ref_traj_length]
-        min_diffs, min_indices = torch.min(diff_masked, dim=1)  # Shapes: [num_envs], [num_envs]
-        no_valid_indices = torch.isinf(min_diffs)  # Shape: [num_envs]
-        target_list = torch.empty((self.num_envs, 3), device=self.device)
-        default_target = self.target[0] + self.point_could_origin_offset[0]  # Shape: [3]
-        target_list[:] = default_target
-        valid_indices = ~no_valid_indices
-        selected_indices = min_indices[valid_indices]
-        targets = self.ref_traj[selected_indices]  # Shape: [num_valid_envs, 3]
-        target_list[valid_indices] = targets
-        target_list = target_list - self.point_could_origin_offset
+        log_prob = dist_policy.log_prob(actions).sum(dim=-1)
+        return actions, log_prob
 
 
+    def get_log_prob_and_entropy(self, actor, obs, actions):
+        mean = actor(obs)  
+        log_std = actor.get_logstd()
+        log_std = log_std.clamp(-20, 2)
+        std = log_std.exp()
+        dist_policy = dist.Normal(mean, std)
 
-        # ## Original way
-        survive_reward = self.survive_reward
-        up_reward = self.up_strength * self.obs_buf[:, 10]
-        heading_reward = self.heading_strength * yaw_alignment
-        # lin_vel_reward = self.lin_strength * torch.linalg.norm(self.privilege_obs_buf[:, 3:5], dim=1) 
-        # lin_vel_reward = self.lin_strength * torch.linalg.norm(self.obs_buf[:, 19:21], dim=1) 
-        lin_vel_reward = self.lin_strength * torch.sum(torch.square(self.obs_buf[:, 19:21]), dim=-1) 
-        # ang_vel_penalty = torch.sum(torch.square(self.obs_buf[:, 7:10]), dim = -1) * self.ang_vel_penalty
-        # ang_vel_penalty = torch.linalg.norm(self.obs_buf[:, 7:10], dim=1) * self.ang_vel_penalty
-        # ang_vel_penalty = torch.linalg.norm(self.obs_buf[:, 7:9], dim=1) * self.ang_vel_penalty # not penalty yaw
-        # ang_acc_penalty = torch.linalg.norm(self.obs_buf[:, 51:54], dim=1) * self.ang_acc_penalty
-        action_penalty = torch.sum(torch.square(self.obs_buf[:, 11:15]), dim = -1) * self.action_penalty # penalty on force
-        action_penalty += torch.square(self.obs_buf[:, 14]) * self.yaw_strength
-        action_change_penalty = torch.sum(torch.square((self.obs_buf[:, 11:15] - self.obs_buf[:, 15:19])), dim = -1) * self.action_change_penalty # penalty on force
-        # height_penalty = torch.abs(self.obs_buf[:,0] - self.height_target) * self.height_penalty
-        height_penalty = torch.square(self.obs_buf[:,0] - self.height_target) * self.height_penalty
-        height_change_penalty = self.height_change_penalty * torch.square(self.obs_buf[:,1])
-        # jitter_penalty = self.jitter_penalty * torch.square(self.obs_buf[:,2])
-        jitter_penalty = self.jitter_penalty * torch.square(self.privilege_obs_buf[:,8])
-        out_map_penalty = self.out_map_penalty * (
-            torch.clamp(self.map_x_min - self.privilege_obs_buf[:, 0], min=0) ** 2 +
-            torch.clamp(self.privilege_obs_buf[:, 0] - self.map_x_max, min=0) ** 2 +
-            torch.clamp(self.map_y_min - self.privilege_obs_buf[:, 1], min=0) ** 2 +
-            torch.clamp(self.privilege_obs_buf[:, 1] - self.map_y_max, min=0) ** 2
-        )
-        map_center_penalty = self.map_center_penalty * torch.square(self.privilege_obs_buf[:,2])
-
-        wp_reward = torch.zeros(self.num_envs, device=self.device)
-        for i, waypoint in enumerate(self.reward_wp):
-            waypoint = waypoint.repeat((self.num_envs,1))
-            distances = torch.norm(self.privilege_obs_buf[:, 0:3] - waypoint, dim=1)**2
-            factor = (torch.exp(1 / (distances+torch.ones(self.num_envs, device=self.device))) - torch.ones(self.num_envs, device=self.device)) # 0-1
-            # factor = torch.exp(-distances) # 0-1
-            wp_reward += factor * self.waypoint_strength
-
-        
-        
-        desire_velo_norm = (target_list - self.privilege_obs_buf[:, 0:3]) / torch.clamp(torch.norm(target_list - self.privilege_obs_buf[:, 0:3], dim=1, keepdim=True), min=1e-6)
-        curr_velo_norm = self.obs_buf[:, 19:22] / torch.clamp(torch.norm(self.obs_buf[:, 19:22], dim=1, keepdim=True), min=1e-2)
-        # velo_dist = torch.linalg.norm(curr_velo_norm[:, [0,2]] - desire_velo_norm[:, [0,2]], dim=1)
-        velo_dist = torch.linalg.norm(curr_velo_norm - desire_velo_norm, dim=1)
-        target_reward = velo_dist * self.target_factor
-
-        # target_dist = torch.linalg.norm(self.privilege_obs_buf[:, 0:3] - target_list, dim=1)**2
-        # target_dist = torch.linalg.norm(self.privilege_obs_buf[:, [0,2]] - target_list[:, [0,2]], dim=1)**2
-        # target_reward = target_dist * self.target_factor
-        # target_reward = self.target_factor * torch.exp(-target_dist)
-
-        # dist to obstacle based on ground truth
-        obst_reward = torch.tensor([0.], requires_grad=True, device=self.device)
-        self.time_report.start_timer("point cloud collision check")
-        obst_dist = self.point_cloud.compute_nearest_distances(drone_pos, drone_rot)
-        self.time_report.end_timer("point cloud collision check")
-        # reward larger distance away from obstacles
-        obst_reward = obst_reward + torch.where(obst_dist < self.obst_threshold, obst_dist*self.obstacle_strength, torch.zeros_like(obst_dist))
-        # penalty collision
-        obst_reward = obst_reward + torch.where(obst_dist < self.obst_collision_limit, torch.ones_like(obst_dist)*self.collision_penalty, torch.zeros_like(obst_dist))
-        
-        self.rew_buf = (
-                        survive_reward + 
-                        obst_reward + 
-                        # ang_vel_penalty + 
-                        # ang_acc_penalty +
-                        lin_vel_reward + 
-                        up_reward + 
-                        heading_reward + 
-                        target_reward + 
-                        action_penalty + 
-                        action_change_penalty +
-                        height_penalty + 
-                        out_map_penalty + 
-                        map_center_penalty +
-                        height_change_penalty +
-                        jitter_penalty +
-                        wp_reward 
-                        )
-            
-        
-        # reset agents
-        condition_dist = (obst_dist < self.obst_collision_limit)
-        condition_loss = (self.rew_buf < -10)
-        # condition_senity = ~(((self.obs_buf > -1000) & (self.obs_buf < 1000) & ~torch.isnan(self.obs_buf)& ~torch.isinf(self.obs_buf)).all(dim=1))
-        condition_senity = ~(( ~torch.isnan(self.obs_buf)& ~torch.isinf(self.obs_buf)).all(dim=1))
-        condition_body_rate = torch.linalg.norm(self.privilege_obs_buf[:,10:13], dim=1) > self.body_rate_threshold
-        condition_height = (self.privilege_obs_buf[:,2] > 4.) | (self.privilege_obs_buf[:,2] < 0.)
-        condition_out_of_bounds = (
-            (self.privilege_obs_buf[:, 0] < self.map_limit_fact * self.map_x_min) |
-            (self.privilege_obs_buf[:, 0] > self.map_limit_fact * self.map_x_max) |
-            (self.privilege_obs_buf[:, 1] < self.map_limit_fact * self.map_y_min) |
-            (self.privilege_obs_buf[:, 1] > self.map_limit_fact * self.map_y_max)
-        )
-        condition_train = self.progress_buf > self.episode_length - 1
-        combined_condition = condition_body_rate | condition_train
-        if self.early_termination:
-            if self.condition_approach == 1:
-                combined_condition = combined_condition | condition_senity | condition_loss
-            elif self.condition_approach == 2:
-                combined_condition = combined_condition | condition_height | condition_senity | condition_loss
-            elif self.condition_approach == 3:
-                combined_condition = condition_dist | condition_height | combined_condition
-            elif self.condition_approach == 4:
-                combined_condition = condition_height | combined_condition | condition_out_of_bounds | condition_senity
-        
-        # ## used for adding breakpoint
-        # if self.episode_count % 20 == 0:
-        # if self.episode_count > 140:
-        #     print(self.episode_count)
-
-        self.reset_buf = torch.where(combined_condition, torch.ones_like(self.reset_buf), self.reset_buf)
-
-        if self.visualize:
-            if self.episode_count == (self.episode_length-1) or combined_condition.any():
-                self.save_recordings()
-
-    def calculateReward_new(self):
-        torso_pos = self.privilege_obs_buf[:, 0:3]
-        # torso_rot = self.obs_buf[:, 3:7]
-        torso_quat = self.obs_buf[:, 3:7] # (x,y,z,w)
-        drone_rot = torso_quat # (x, y, z, w)
-        drone_pos = torso_pos + self.point_could_origin_offset # in point cloud dimension
-        drone_target = self.target + self.point_could_origin_offset
-
-        # make yaw angle align with velocity
-        # target_dirs = tu.normalize(self.privilege_obs_buf[:, [3,5]])
-        # rpy = quaternion_to_euler(torso_quat[:, [3,0,2,1]]) # input is (w,x,z,y)
-        # heading_vec = torch.cat([torch.cos(rpy[:,2].unsqueeze(-1)), torch.sin(rpy[:,2].unsqueeze(-1))], dim=1) 
-        # yaw_alignment = (heading_vec * target_dirs).sum(dim = -1)
-
-        # use quat directly
-        target_dirs = tu.normalize(self.privilege_obs_buf[:, 3:5])
-        heading_vec = quaternion_yaw_forward(torso_quat)  # Extract (x, y) forward direction, input is (x, y, z, w)
-        yaw_alignment = (heading_vec * target_dirs).sum(dim=-1)
-
-        # Compute ref_x for all environments
-        ref_x = self.privilege_obs_buf[:, 0] + self.point_could_origin_offset[0, 0]  # Shape: [num_envs]
-        ref_traj_x = self.ref_traj[:, 0]  # Shape: [ref_traj_length]
-        diff = ref_traj_x.unsqueeze(0) - ref_x.unsqueeze(1)  # Shape: [num_envs, ref_traj_length]
-        mask = diff > 0.5  # Shape: [num_envs, ref_traj_length]
-        diff_masked = torch.where(mask, diff, float('inf'))  # Shape: [num_envs, ref_traj_length]
-        min_diffs, min_indices = torch.min(diff_masked, dim=1)  # Shapes: [num_envs], [num_envs]
-        no_valid_indices = torch.isinf(min_diffs)  # Shape: [num_envs]
-        target_list = torch.empty((self.num_envs, 3), device=self.device)
-        default_target = self.target[0] + self.point_could_origin_offset[0]  # Shape: [3]
-        target_list[:] = default_target
-        valid_indices = ~no_valid_indices
-        selected_indices = min_indices[valid_indices]
-        targets = self.ref_traj[selected_indices]  # Shape: [num_valid_envs, 3]
-        target_list[valid_indices] = targets
-        target_list = target_list - self.point_could_origin_offset
-        obst_dist = self.point_cloud.compute_nearest_distances(drone_pos, drone_rot)
-
-        desire_velo_norm = (target_list - self.privilege_obs_buf[:, 0:3]) / torch.clamp(torch.norm(target_list - self.privilege_obs_buf[:, 0:3], dim=1, keepdim=True), min=1e-6)
-        curr_velo_norm = self.obs_buf[:, 19:22] / torch.clamp(torch.norm(self.obs_buf[:, 19:22], dim=1, keepdim=True), min=1e-2)
-        # velo_dist = torch.linalg.norm(curr_velo_norm[:, [0,2]] - desire_velo_norm[:, [0,2]], dim=1)
-        velo_dist = torch.linalg.norm(curr_velo_norm - desire_velo_norm, dim=1)
-
-
-        # Converted reward components
-        survive_reward = self.survive_reward
-        up_reward = self.up_strength * self.obs_buf[:, 10]
-        heading_reward = self.heading_strength * yaw_alignment
-        
-        # Converted linear velocity reward (reward for target-aligned movement)
-        desired_vel = self.privilege_obs_buf[:, 3:5]
-        actual_vel = self.obs_buf[:, 19:21]
-        vel_alignment = (desired_vel * actual_vel).sum(dim=1)
-        lin_vel_reward = self.lin_strength * vel_alignment
-        
-        # Action rewards (reward for smaller/consistent actions)
-        action_reward = self.action_reward * (1.0 / (1.0 + torch.sum(torch.square(self.obs_buf[:, 11:15]), dim=-1)))
-        action_consistency = 1.0 / (1.0 + torch.sum(torch.square(self.obs_buf[:, 11:15] - self.obs_buf[:, 15:19]), dim=-1))
-        action_consistency_reward = self.action_consistency_reward * action_consistency
-        
-        # Height rewards
-        height_diff = torch.abs(self.obs_buf[:,0] - self.height_target)
-        height_reward = self.height_reward * (1.0 / (1.0 + height_diff))
-        height_stability = 1.0 / (1.0 + torch.square(self.obs_buf[:,1]))
-        height_stability_reward = self.height_stability_reward * height_stability
-        
-        # Smoothness reward
-        smoothness = 1.0 / (1.0 + torch.square(self.privilege_obs_buf[:,8]))
-        smoothness_reward = self.smoothness_reward * smoothness
-        
-        # Map boundary rewards
-        in_bounds = torch.ones_like(self.privilege_obs_buf[:,0])
-        in_bounds = in_bounds - torch.clamp(self.map_x_min - self.privilege_obs_buf[:, 0], min=0)
-        in_bounds = in_bounds - torch.clamp(self.privilege_obs_buf[:, 0] - self.map_x_max, min=0)
-        in_bounds = in_bounds - torch.clamp(self.map_y_min - self.privilege_obs_buf[:, 1], min=0)
-        in_bounds = in_bounds - torch.clamp(self.privilege_obs_buf[:, 1] - self.map_y_max, min=0)
-        in_bounds_reward = self.in_bounds_reward * in_bounds
-        
-        center_distance = torch.norm(self.privilege_obs_buf[:, 0:2], dim=1)
-        map_center_reward = self.map_center_reward * (1.0 / (1.0 + center_distance))
-        
-        # Converted waypoint following
-        wp_reward = torch.zeros(self.num_envs, device=self.device)
-        for i, waypoint in enumerate(self.reward_wp):
-            distances = torch.norm(self.privilege_obs_buf[:, 0:3] - waypoint, dim=1)
-            wp_reward += self.waypoint_strength * (1.0 / (1.0 + distances))
-
-        # Target alignment reward
-        vel_alignment = (curr_velo_norm * desire_velo_norm).sum(dim=1)
-        target_reward = self.target_alignment_factor * vel_alignment
-
-        # Obstacle rewards
-        obst_reward = self.obstacle_clearance_reward * (obst_dist / self.obst_threshold)
-        collision_penalty = torch.where(obst_dist < self.obst_collision_limit, 
-                                    self.collision_penalty, 
-                                    torch.zeros_like(obst_dist))
-        self.rew_buf = (
-            survive_reward +
-            obst_reward +
-            lin_vel_reward +
-            up_reward +
-            heading_reward +
-            target_reward +
-            action_reward +
-            action_consistency_reward +
-            height_reward +
-            height_stability_reward +
-            smoothness_reward +
-            in_bounds_reward +
-            map_center_reward +
-            wp_reward +
-            collision_penalty  # Only remaining penalty
-        )
-
-        # reset agents
-        condition_dist = (obst_dist < self.obst_collision_limit)
-        condition_loss = (self.rew_buf < -10)
-        # condition_senity = ~(((self.obs_buf > -1000) & (self.obs_buf < 1000) & ~torch.isnan(self.obs_buf)& ~torch.isinf(self.obs_buf)).all(dim=1))
-        condition_senity = ~(( ~torch.isnan(self.obs_buf)& ~torch.isinf(self.obs_buf)).all(dim=1))
-        condition_body_rate = torch.linalg.norm(self.privilege_obs_buf[:,10:13], dim=1) > self.body_rate_threshold
-        condition_height = (self.privilege_obs_buf[:,2] > 4.) | (self.privilege_obs_buf[:,2] < 0.)
-        condition_out_of_bounds = (
-            (self.privilege_obs_buf[:, 0] < self.map_limit_fact * self.map_x_min) |
-            (self.privilege_obs_buf[:, 0] > self.map_limit_fact * self.map_x_max) |
-            (self.privilege_obs_buf[:, 1] < self.map_limit_fact * self.map_y_min) |
-            (self.privilege_obs_buf[:, 1] > self.map_limit_fact * self.map_y_max)
-        )
-        condition_train = self.progress_buf > self.episode_length - 1
-        combined_condition = condition_body_rate | condition_train
-        if self.early_termination:
-            if self.condition_approach == 1:
-                combined_condition = combined_condition | condition_senity | condition_loss
-            elif self.condition_approach == 2:
-                combined_condition = combined_condition | condition_height | condition_senity | condition_loss
-            elif self.condition_approach == 3:
-                combined_condition = condition_dist | condition_height | combined_condition
-            elif self.condition_approach == 4:
-                combined_condition = condition_height | combined_condition | condition_out_of_bounds | condition_senity
-        
-        # ## used for adding breakpoint
-        # if self.episode_count % 20 == 0:
-        # if self.episode_count > 140:
-        #     print(self.episode_count)
-
-        self.reset_buf = torch.where(combined_condition, torch.ones_like(self.reset_buf), self.reset_buf)
-
-        if self.visualize:
-            if self.episode_count == (self.episode_length-1) or combined_condition.any():
-                self.save_recordings()
-
-    def save_recordings(self):
-        save_path = self.save_path
-        np.save(f'{save_path}/x.npy', np.array(self.x_record, dtype=object), allow_pickle=True)
-        np.save(f'{save_path}/y.npy', np.array(self.y_record, dtype=object), allow_pickle=True)
-        np.save(f'{save_path}/z.npy', np.array(self.z_record, dtype=object), allow_pickle=True)
-
-        # # figure x over time
-        # plt.figure()
-        # plt.plot(range(len(self.x_record)), self.x_record)
-        # plt.xlabel("Step")
-        # plt.ylabel("X/m")
-        # plt.savefig(f'{save_path}/x_plot.png')
-
-        # # figure y over time
-        # plt.figure()
-        # plt.plot(range(len(self.y_record)), self.y_record)
-        # plt.xlabel("Step")
-        # plt.ylabel("Y/m")
-        # plt.savefig(f'{save_path}/y_plot.png')
-
-        # # figure z over time
-        plt.figure()
-        plt.plot(range(len(self.z_record)), self.z_record)
-        plt.xlabel("Step")
-        plt.ylabel("Z/m")
-        plt.savefig(f'{save_path}/z_plot.png')
-
-        # figure pose over time
-        plt.figure()
-        plt.plot(range(len(self.x_record)), self.x_record)
-        plt.plot(range(len(self.y_record)), self.y_record)
-        plt.plot(range(len(self.z_record)), self.z_record)
-        plt.xlabel("Step")
-        plt.ylabel("m")
-        plt.legend(['x', 'y', 'z'])
-        plt.savefig(f'{save_path}/pos_plot.png')
-
-        # figure traj 
-        wp_np = self.reward_wp.clone().detach().cpu().numpy()
-        target = self.target[0,:].clone().detach().cpu().numpy()
-        plt.figure()
-        plt.plot(self.x_record, self.y_record)
-
-        # draw waypoints
-        wp_num, _ = wp_np.shape
-        if wp_num > 0:
-            for i in range(wp_num-1):
-                circle = plt.Circle((wp_np[i][0], wp_np[i][1]), 0.3, color='b', fill=True)
-                plt.gca().add_patch(circle)
-            circle = plt.Circle((wp_np[-1][0], wp_np[-1][1]), 0.5, color='r', fill=True)
-            plt.gca().add_patch(circle)
-
-        plt.gca().set_aspect('equal', adjustable='box')
-        plt.xlabel("X/m")
-        plt.ylabel("Y/m")
-        plt.savefig(f'{save_path}/traj_plot.png')
-
-        # figure pose over time
-        plt.figure()
-        plt.plot(range(len(self.roll_record)), self.roll_record)
-        plt.plot(range(len(self.pitch_record)), self.pitch_record)
-        plt.plot(range(len(self.yaw_record)), self.yaw_record)
-        plt.xlabel("Step")
-        plt.ylabel("rad")
-        plt.legend(['r', 'p', 'y'])
-        plt.savefig(f'{save_path}/pose_plot.png')
-
-        # figure velo over time
-        plt.figure()
-        plt.plot(range(len(self.velo_x_record)), self.velo_x_record)
-        plt.plot(range(len(self.velo_y_record)), self.velo_y_record)
-        plt.plot(range(len(self.velo_z_record)), self.velo_z_record)
-        plt.plot(range(len(self.vae_velo_x_record)), self.vae_velo_x_record, linestyle='dashed')
-        plt.plot(range(len(self.vae_velo_y_record)), self.vae_velo_y_record, linestyle='dashed')
-        plt.plot(range(len(self.vae_velo_z_record)), self.vae_velo_z_record, linestyle='dashed')
-        plt.xlabel("Step")
-        plt.ylabel("m/s")
-        plt.legend(['vx', 'vy', 'vz', 'vae_vx', 'vae_vy', 'vae_vz'])
-        plt.savefig(f'{save_path}/velo_plot.png')
-
-
-        # figure depth 
-        plt.figure()
-        plt.plot(range(len(self.depth_record)), self.depth_record)
-        plt.xlabel("Step")
-        plt.ylabel("depth/m")
-        plt.savefig(f'{save_path}/depth_plot.png')
-
-        # figure action
-        plt.figure()
-        for action_id in range(3):
-            plt.plot(range(np.shape(self.action_record)[0]), self.action_record[:,action_id], label=f'rotor {action_id}') 
-        plt.plot(range(len(self.ang_velo_x_record)), self.ang_velo_x_record, linestyle='dashed')
-        plt.plot(range(len(self.ang_velo_y_record)), self.ang_velo_y_record, linestyle='dashed')
-        plt.plot(range(len(self.ang_velo_z_record)), self.ang_velo_z_record, linestyle='dashed')
-        plt.xlabel('Step')
-        plt.ylabel('body_rate')
-        plt.legend(['r_des', 'p_des', 'y_des', 'r', 'p', 'y'])
-        plt.savefig(f'{save_path}/body_rate_plot.png')
-        np.savetxt(f'{save_path}/action.txt', self.action_record, delimiter=',')
-
-
-        plt.figure()
-        plt.plot(range(np.shape(self.action_record)[0]), self.action_record[:,3]) 
-        plt.xlabel('Step')
-        plt.ylabel('normalized_force')
-        plt.savefig(f'{save_path}/action_force_plot.png')
-
-        # save video
-        video_tensor = torch.permute(torch.stack(self.img_record), (0, 2, 3, 1)) * 255
-        video_tensor = video_tensor.to('cpu')
-        video_tensor_uint8 = video_tensor.to(dtype=torch.uint8)
-        write_video(f'{save_path}/ego_video.mp4', video_tensor_uint8, fps=30)
-
+        log_prob = dist_policy.log_prob(actions).sum(dim=-1)
+        entropy = dist_policy.entropy().sum(dim=-1)
+        return log_prob, entropy
     
+    
+    @torch.no_grad()
+    def evaluate_policy(self, num_games, deterministic = False):
+        episode_length_his = []
+        episode_loss_his = []
+        episode_discounted_loss_his = []
+        episode_loss = torch.zeros(self.num_envs, dtype = torch.float32, device = self.device)
+        episode_length = torch.zeros(self.num_envs, dtype = int)
+        episode_gamma = torch.ones(self.num_envs, dtype = torch.float32, device = self.device)
+        episode_discounted_loss = torch.zeros(self.num_envs, dtype = torch.float32, device = self.device)
+        obs = self.env.reset()
+        games_cnt = 0
+
+        while games_cnt < num_games:
+            raw_obs = obs.clone()
+            if self.obs_rms is not None:
+                obs = self.obs_rms.normalize(obs)
+            
+            if self.eval_LPF:
+                # Add LPF
+                actions = self.actor(obs, deterministic=deterministic)
+                actions = torch.tanh(actions)
+                # Apply the LPF
+                actions[:, 0] = self.eval_r_filter.filter(actions[:, 0])
+                actions[:, 1] = self.eval_p_filter.filter(actions[:, 1])
+                actions[:, 2] = self.eval_y_filter.filter(actions[:, 2])
+                actions[:, 3] = self.eval_thrust_filter.filter(actions[:, 3])
+
+                vae_output, _ = self.vae.forward(self.obs_hist_buf)
+                obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(actions, vae_output)
+            else:
+                # No LPF
+                actions = self.actor(obs, deterministic = deterministic)
+                vae_output, _ = self.vae.forward(self.obs_hist_buf)
+                obs, privilege_obs, history_obs, vel_obs, rew, done, extra_info = self.env.step(torch.tanh(actions), vae_output)
+            
+            self.obs_hist_buf = history_obs
+            episode_length += 1
+            done_env_ids = done.nonzero(as_tuple = False).squeeze(-1)
+
+            episode_loss -= rew
+            episode_discounted_loss -= episode_gamma * rew
+            episode_gamma *= self.gamma
+            if len(done_env_ids) > 0:
+                for done_env_id in done_env_ids:
+                    print('loss = {:.2f}, len = {}'.format(episode_loss[done_env_id].item(), episode_length[done_env_id]))
+                    episode_loss_his.append(episode_loss[done_env_id].item())
+                    episode_discounted_loss_his.append(episode_discounted_loss[done_env_id].item())
+                    episode_length_his.append(episode_length[done_env_id].item())
+                    episode_loss[done_env_id] = 0.
+                    episode_discounted_loss[done_env_id] = 0.
+                    episode_length[done_env_id] = 0
+                    episode_gamma[done_env_id] = 1.
+                    games_cnt += 1
+        
+        mean_episode_length = np.mean(np.array(episode_length_his))
+        mean_policy_loss = np.mean(np.array(episode_loss_his))
+        mean_policy_discounted_loss = np.mean(np.array(episode_discounted_loss_his))
+ 
+        return mean_policy_loss, mean_policy_discounted_loss, mean_episode_length
+    
+    @torch.no_grad()
+    def run(self, num_games):
+        mean_policy_loss, mean_policy_discounted_loss, mean_episode_length = self.evaluate_policy(num_games = num_games, deterministic = not self.stochastic_evaluation)
+        print_info('mean episode loss = {}, mean discounted loss = {}, mean episode length = {}'.format(mean_policy_loss, mean_policy_discounted_loss, mean_episode_length))
+
+
+    def play(self, cfg):
+        ckpt_path = cfg['params']['general']['checkpoint']
+        ckpt_dir = os.path.dirname(ckpt_path)
+        self.load(cfg['params']['general']['checkpoint'])
+        self.run(cfg['params']['config']['player']['games_num'])
+
+    def save(self, filename = None):
+        if filename is None:
+            filename = 'best_policy'
+        torch.save([self.actor, self.critic, self.target_critic, self.obs_rms, self.vae, self.env.visual_net], os.path.join(self.log_dir, "{}.pt".format(filename)))
+
+    def load(self, path):
+        print(path)
+        checkpoint = torch.load(path)
+        self.actor = checkpoint[0].to(self.device)
+        self.critic = checkpoint[1].to(self.device)
+        self.target_critic = checkpoint[2].to(self.device)
+        self.obs_rms = checkpoint[3].to(self.device)
+        self.vae = checkpoint[4].to(self.device)
+        self.env.visual_net = checkpoint[5].to(self.device)
+        print_info(f"all nets have been loaded")

@@ -57,23 +57,11 @@
             "console": "integratedTerminal"
         },
 
-        {
-            "name": "Distill Policy",
-            "type": "python",
-            "request": "launch",
-            "program": "${workspaceFolder}/examples/train_distill_policy.py",
-            "args": [
-                "--cfg", "examples/cfg/gradnav/drone_long_traj.yaml", 
-                "--teacher_dir", "examples/logs/DroneLongTraj/gradnav/gate_right/01-27-2025-13-47-33",
-                "--policy_name", "best_policy.pt"
-            ],
-            "console": "integratedTerminal"
-        },
 
 
         // baseline training with PPO
         {
-            "name": "Train Quadrotor PPO",
+            "name": "Train PPO long traj",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/examples/train_ppo.py",
@@ -85,7 +73,7 @@
             "console": "integratedTerminal"
         },
         {
-            "name": "Test Quadrotor PPO",
+            "name": "Test PPO long traj",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/examples/train_ppo.py",
@@ -99,7 +87,7 @@
         },
 
         {
-            "name": "Train Quadrotor GS Traj Global BPTT",
+            "name": "Train BPTT long traj",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/examples/train_bptt.py",
@@ -112,7 +100,7 @@
             "console": "integratedTerminal"
         },
         {
-            "name": "Test Quadrotor GS Traj Global BPTT",
+            "name": "Test BPTT long traj",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/examples/train_bptt.py",

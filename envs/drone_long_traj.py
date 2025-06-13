@@ -1,10 +1,3 @@
-# Copyright (c) 2022 NVIDIA CORPORATION.  All rights reserved.
-# NVIDIA CORPORATION and its licensors retain all intellectual property
-# and proprietary rights in and to this software, related documentation
-# and any modifications thereto.  Any use, reproduction, disclosure or
-# distribution of this software and related documentation without an express
-# license agreement from NVIDIA CORPORATION is strictly prohibited.
-
 from envs.dflex_env import DFlexEnv
 import torch
 torch.autograd.set_detect_anomaly(True)
@@ -205,7 +198,7 @@ class DroneLongTrajEnv(DFlexEnv):
             
         else:
             raise ValueError(f"Map {self.map_name} is not supported for reward parameters setup.")
-    
+
         
         # Navigation parameters
         self.obst_threshold = 0.5
@@ -220,7 +213,7 @@ class DroneLongTrajEnv(DFlexEnv):
         self.gs_count = 0
         self.gs_freq = 1 # 3D GS inference frequency
         self.depth_list = 0
-        
+
 
         # Set up visual perception net
         self.visual_net = VisualPerceptionNet(visual_feature_size=self.visual_feature_size).to(self.device)
@@ -346,7 +339,7 @@ class DroneLongTrajEnv(DFlexEnv):
             self.start_body_rate = [0., 0., 0.]
         else:
             raise ValueError(f"Map {self.map_name} is not supported for start position setup.")
-        
+
 
         self.start_pos = []
         self.start_norm_thrust = [(self.hover_thrust / self.max_thrust).clone().detach().cpu().numpy()[0]]
@@ -357,6 +350,7 @@ class DroneLongTrajEnv(DFlexEnv):
         for i in range(self.num_environments):
             start_pos = [start_pos_x, start_pos_y, self.start_height, ]
             self.start_pos.append(start_pos)
+
 
         # start_x variables for reseting drones       
         self.start_pos = tu.to_torch(self.start_pos, device=self.device)
@@ -410,7 +404,7 @@ class DroneLongTrajEnv(DFlexEnv):
         ang_vel = self.state_joint_qd.view(self.num_envs, -1)[:, 0:3]
         lin_acc = self.state_joint_qdd.view(self.num_envs, -1)[:, 3:6]
         ang_acc = self.state_joint_qdd.view(self.num_envs, -1)[:, 0:3]
-        
+
         # Core dynamic simulation
         self.time_report.start_timer("dynamic simulation")
         new_position, new_linear_velocity, new_angular_velocity, new_quaternion, new_linear_acceleration, new_angular_acceleration = \
@@ -467,8 +461,7 @@ class DroneLongTrajEnv(DFlexEnv):
             obs_vel = torch.nan_to_num(obs_vel, nan=0.0, posinf=1e3, neginf=-1e3)
 
         return self.obs_buf, self.privilege_obs_buf, obs_hist, obs_vel, self.rew_buf, self.reset_buf, self.extras
-    
-    
+
 
     def reset(self, env_ids = None, force_reset = True):
         if env_ids is None:
@@ -543,6 +536,7 @@ class DroneLongTrajEnv(DFlexEnv):
 
         return self.obs_buf
     
+
     def clear_grad(self, checkpoint = None):
         with torch.no_grad():
             if checkpoint is None:
@@ -566,6 +560,7 @@ class DroneLongTrajEnv(DFlexEnv):
             self.progress_buf = checkpoint['progress_buf'].clone()
             self.latent_vect = checkpoint['latent_vect'].clone()
             self.prev_lin_vel = checkpoint['prev_lin_vel'].clone()
+
 
     def initialize_trajectory(self):
         self.clear_grad()
@@ -622,13 +617,13 @@ class DroneLongTrajEnv(DFlexEnv):
                 depth_list, rgb_img = self.gs.render(gs_pose) # (batch_size,H,W,1/3)
                 self.process_GS_data(depth_list, rgb_img)
                 self.time_report.end_timer("3D GS inference")
-            self.gs_count += 1            
+            self.gs_count += 1
             
         # Update records for visualization
         if self.visualize:
             self.record_visualization_data(gs_pose, torso_pos, ang_vel, lin_vel, rpy_data)
 
-        # Abalation variables        
+        # Abalation variables
         latent_abalation = torch.zeros_like(self.latent_vect)
 
         # adding noise
@@ -649,8 +644,8 @@ class DroneLongTrajEnv(DFlexEnv):
                                 self.actions, # 18:22
                                 self.prev_actions, # 22:26
                                 self.depth_list, # 26
-                                self.visual_info, # 27:51
-                                self.latent_vect, # 51:67
+                                self.visual_info, # 27:43
+                                self.latent_vect, # 43:67
                                 ], 
                                 dim = -1)
 
@@ -661,8 +656,8 @@ class DroneLongTrajEnv(DFlexEnv):
                                 self.actions, # 6:10
                                 self.prev_actions, # 10:14
                                 lin_vel, # 14:17
-                                self.visual_info+visual_noise, # 17:41                                    
-                                self.latent_vect+latent_noise, # 41:57
+                                self.visual_info+visual_noise, # 17:33
+                                self.latent_vect+latent_noise, # 33:57
                                 ], 
                                 dim = -1)
             
@@ -674,8 +669,8 @@ class DroneLongTrajEnv(DFlexEnv):
                                 self.actions, # 6:10
                                 self.prev_actions, # 10:14
                                 lin_vel, # 14:17
-                                self.visual_info+visual_noise, # 17:41                                    
-                                latent_abalation, # 41:57
+                                self.visual_info+visual_noise, # 17:33                                    
+                                latent_abalation, # 33:57
                                 ], 
                                 dim = -1)
         
@@ -689,6 +684,7 @@ class DroneLongTrajEnv(DFlexEnv):
         if (torch.isnan(self.vae_obs_buf).any() | torch.isinf(self.vae_obs_buf).any()):
             print('nan')
             self.vae_obs_buf = torch.nan_to_num(self.vae_obs_buf, nan=0.0, posinf=1e3, neginf=-1e3)
+
 
     def calculateReward(self):
         torso_pos = self.privilege_obs_buf[:, 0:3]
@@ -777,7 +773,7 @@ class DroneLongTrajEnv(DFlexEnv):
                         wp_reward 
                         )
             
-        
+
         # Early termination settings
         condition_senity = ~(( ~torch.isnan(self.obs_buf)& ~torch.isinf(self.obs_buf)).all(dim=1))
         condition_body_rate = torch.linalg.norm(self.privilege_obs_buf[:,10:13], dim=1) > self.body_rate_threshold
@@ -792,7 +788,6 @@ class DroneLongTrajEnv(DFlexEnv):
         combined_condition = condition_body_rate | condition_train
         if self.early_termination:
             combined_condition = condition_height | combined_condition | condition_out_of_bounds | condition_senity
-        
 
         self.reset_buf = torch.where(combined_condition, torch.ones_like(self.reset_buf), self.reset_buf)
 
@@ -834,6 +829,7 @@ class DroneLongTrajEnv(DFlexEnv):
         if self.episode_count < self.episode_length:
             self.action_record[self.episode_count, :] = action_data
         self.episode_count += 1
+
 
     def save_recordings(self):
         save_path = self.save_path

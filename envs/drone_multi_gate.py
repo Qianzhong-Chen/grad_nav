@@ -1,10 +1,3 @@
-# Copyright (c) 2022 NVIDIA CORPORATION.  All rights reserved.
-# NVIDIA CORPORATION and its licensors retain all intellectual property
-# and proprietary rights in and to this software, related documentation
-# and any modifications thereto.  Any use, reproduction, disclosure or
-# distribution of this software and related documentation without an express
-# license agreement from NVIDIA CORPORATION is strictly prohibited.
-
 from envs.dflex_env import DFlexEnv
 import torch
 torch.autograd.set_detect_anomaly(True)
@@ -54,13 +47,13 @@ class DroneMultiGateEnv(DFlexEnv):
                  ):
 
 
-        self.agent_name = 'drone_long_traj'
+        self.agent_name = 'drone_multi_gate'
         self.num_history = env_hyper.get('HISTORY_BUFFER_NUM', 5)
         self.num_latent = env_hyper.get('LATENT_VECT_NUM', 24)
         self.visual_feature_size = env_hyper.get('SINGLE_VISUAL_INPUT_SIZE', 16)
         self.num_privilege_obs = 27 + self.visual_feature_size + self.num_latent
         self.num_latent_obs = 17 + self.num_latent + self.visual_feature_size
-        num_obs = 17 + self.num_latent + self.visual_feature_size # correspond with self.obs_buf
+        num_obs = 17 + self.num_latent + self.visual_feature_size 
         num_act = 4
 
         print(f'device: {device}')
@@ -105,8 +98,8 @@ class DroneMultiGateEnv(DFlexEnv):
 
        # GS model
         gs_dir = Path("assets/gs_data")
-        resolution_quality = 0.4
-        self.gs = get_gs(self.map_name, gs_dir, resolution_quality)
+        self.resolution_quality = 0.4
+        self.gs = get_gs(self.map_name, gs_dir, self.resolution_quality)
 
         self.init_sim()
         self.episode_length = episode_length
@@ -186,7 +179,7 @@ class DroneMultiGateEnv(DFlexEnv):
             "mass_range": self.mass_range,
             "min_thrust": self.min_thrust,
             "min_thrust": self.thrust_range,
-            "resolution_quality": resolution_quality,
+            "resolution_quality": self.resolution_quality,
             "br_delay_factor": self.br_delay_factor,
             "thrust_delay_factor":self.thrust_delay_factor,
             "start_height": self.start_height,
@@ -649,8 +642,8 @@ class DroneMultiGateEnv(DFlexEnv):
                                 self.actions, # 18:22
                                 self.prev_actions, # 22:26
                                 self.depth_list, # 26
-                                self.visual_info, # 27:51
-                                self.latent_vect, # 51:67
+                                self.visual_info, # 27:43
+                                self.latent_vect, # 43:67
                                 ], 
                                 dim = -1)
 
@@ -661,8 +654,8 @@ class DroneMultiGateEnv(DFlexEnv):
                                 self.actions, # 6:10
                                 self.prev_actions, # 10:14
                                 lin_vel, # 14:17
-                                self.visual_info+visual_noise, # 17:41                                    
-                                self.latent_vect+latent_noise, # 41:57
+                                self.visual_info+visual_noise, # 17:33                                    
+                                self.latent_vect+latent_noise, # 33:57
                                 ], 
                                 dim = -1)
             
@@ -674,8 +667,8 @@ class DroneMultiGateEnv(DFlexEnv):
                                 self.actions, # 6:10
                                 self.prev_actions, # 10:14
                                 lin_vel, # 14:17
-                                self.visual_info+visual_noise, # 17:41                                    
-                                latent_abalation, # 41:57
+                                self.visual_info+visual_noise, # 17:33                                    
+                                latent_abalation, # 33:57
                                 ], 
                                 dim = -1)
         

@@ -1,14 +1,4 @@
-# Copyright (c) 2022 NVIDIA CORPORATION.  All rights reserved.
-# NVIDIA CORPORATION and its licensors retain all intellectual property
-# and proprietary rights in and to this software, related documentation
-# and any modifications thereto.  Any use, reproduction, disclosure or
-# distribution of this software and related documentation without an express
-# license agreement from NVIDIA CORPORATION is strictly prohibited.
-
-
-from multiprocessing.sharedctypes import Value
 import sys, os
-
 from torch.nn.utils.clip_grad import clip_grad_norm_
 
 project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -204,7 +194,7 @@ class GradNav:
             ckpt_dir = os.path.dirname(ckpt_path)
             self.load(cfg['params']['general']['checkpoint'])
             print_info(f'actor critic networks recovered from {ckpt_path}')
-        
+
         # for kl divergence computing
         self.old_mus = torch.zeros((self.steps_num, self.num_envs, self.num_actions), dtype = torch.float32, device = self.device)
         self.old_sigmas = torch.zeros((self.steps_num, self.num_envs, self.num_actions), dtype = torch.float32, device = self.device)
@@ -242,7 +232,7 @@ class GradNav:
         self.max_grad = 0
         self.mean_grad = 0
 
-       
+
         
     def compute_actor_loss(self, deterministic = False):
         rew_acc = torch.zeros((self.steps_num + 1, self.num_envs), dtype = torch.float32, device = self.device)
@@ -759,7 +749,7 @@ class GradNav:
         if filename is None:
             filename = 'best_policy'
         torch.save([self.actor, self.critic, self.target_critic, self.obs_rms, self.vae, self.env.visual_net], os.path.join(self.log_dir, "{}.pt".format(filename)))
-    
+
     def load(self, path):
         print(path)
         checkpoint = torch.load(path)
@@ -770,5 +760,3 @@ class GradNav:
         self.vae = checkpoint[4].to(self.device)
         self.env.visual_net = checkpoint[5].to(self.device)
         print_info(f"all nets have been loaded")
-
-    
