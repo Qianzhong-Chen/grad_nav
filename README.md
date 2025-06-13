@@ -18,7 +18,7 @@
 
 - Clone the repository:
   ```
-  git clone git@github.com:Qianzhong-Chen/GRaD_Nav_internal.git
+  git clone https://github.com/Qianzhong-Chen/grad_nav.git
   ```
 
 
