@@ -118,7 +118,6 @@ class DroneLongTrajEnv(DFlexEnv):
                                         [7.6, 0.7, 1.3],
                                         [9.7, 1.5, 0.9],
                                         [11.8, 0, 1.5],
-                                        # [13.0, -2., 1.5]
                                         ], device=self.device) # (x,y,z)
             
             
@@ -137,7 +136,6 @@ class DroneLongTrajEnv(DFlexEnv):
                                         [7.8, 0.6, 1.1],
                                         [9.7, 1.4, 0.7],
                                         [11.0, 0.5, 1.3],
-                                        # [13.0, -2., 1.5]
                                         ], device=self.device) # (x,y,z)
 
 

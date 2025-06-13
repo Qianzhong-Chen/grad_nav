@@ -118,7 +118,6 @@ class DronePPOEnv(DFlexEnv):
                                         [7.6, 0.7, 1.3],
                                         [9.7, 1.5, 0.9],
                                         [11.8, 0, 1.5],
-                                        # [13.0, -2., 1.5]
                                         ], device=self.device) # (x,y,z)
             
             
@@ -137,7 +136,6 @@ class DronePPOEnv(DFlexEnv):
                                         [7.8, 0.6, 1.1],
                                         [9.7, 1.4, 0.7],
                                         [11.0, 0.5, 1.3],
-                                        # [13.0, -2., 1.5]
                                         ], device=self.device) # (x,y,z)
 
 
@@ -163,40 +161,32 @@ class DronePPOEnv(DFlexEnv):
         
         # Other parameters
         if self.map_name == 'gate_mid':
-            self.up_strength = 0.5  # Increased reward for staying upright
-            self.heading_strength = 1.0  # Increased reward for good yaw alignment
-            self.lin_strength = 0.5  # Now rewards appropriate linear velocity
-            self.yaw_strength = 0.2  # Reward for yaw stability
-            self.action_reward = 0.3  # Reward for smaller actions
-            self.action_consistency_reward = 0.2  # Reward for consistent actions
-            self.survive_reward = 8.0  # Unchanged base survival reward
-            self.height_reward = 1.5  # Reward for maintaining target height
-            self.height_stability_reward = 0.3  # Reward for stable altitude
-            self.smoothness_reward = 0.2  # Reward for smooth operation
-            self.in_bounds_reward = 1.0  # Reward for staying within map
-            self.map_center_reward = 0.1  # Reward for staying near center
+            self.heading_strength = 0.5  # reward for yaw alignment
+            self.action_reward = 0.1  # Reward for smaller actions
+            self.action_consistency_reward = 0.1  # Reward for consistent actions
+            self.survive_reward = 8.0  # base survival reward
+            self.height_reward = 0.5  # Reward for maintaining target height
+            self.height_stability_reward = 0.1  # Reward for stable altitude
+            self.in_bounds_reward = 0.25  # Reward for staying within map
+            self.map_center_reward = 0.01  # Reward for staying near center
             # Trajectory
             self.waypoint_strength = 4.0  # Increased waypoint reward
-            self.target_alignment_factor = 4.0  # Reward for velocity alignment
+            self.target_alignment_factor = 2.0  # Reward for velocity alignment
             # Obstacle avoidance
             self.obstacle_clearance_reward = 1.0  # Reward for keeping distance from obstacles
         
         elif self.map_name == 'gate_right':
-            self.up_strength = 0.5  # Increased reward for staying upright
-            self.heading_strength = 1.0  # Increased reward for good yaw alignment
-            self.lin_strength = 0.5  # Now rewards appropriate linear velocity
-            self.yaw_strength = 0.2  # Reward for yaw stability
-            self.action_reward = 0.3  # Reward for smaller actions
-            self.action_consistency_reward = 0.2  # Reward for consistent actions
-            self.survive_reward = 8.0  # Unchanged base survival reward
-            self.height_reward = 1.5  # Reward for maintaining target height
-            self.height_stability_reward = 0.3  # Reward for stable altitude
-            self.smoothness_reward = 0.2  # Reward for smooth operation
-            self.in_bounds_reward = 1.0  # Reward for staying within map
-            self.map_center_reward = 0.1  # Reward for staying near center
+            self.heading_strength = 0.5  # reward for yaw alignment
+            self.action_reward = 0.1  # Reward for smaller actions
+            self.action_consistency_reward = 0.1  # Reward for consistent actions
+            self.survive_reward = 8.0  # base survival reward
+            self.height_reward = 0.5  # Reward for maintaining target height
+            self.height_stability_reward = 0.1  # Reward for stable altitude
+            self.in_bounds_reward = 0.25  # Reward for staying within map
+            self.map_center_reward = 0.01  # Reward for staying near center
             # Trajectory
             self.waypoint_strength = 4.0  # Increased waypoint reward
-            self.target_alignment_factor = 4.0  # Reward for velocity alignment
+            self.target_alignment_factor = 2.0  # Reward for velocity alignment
             # Obstacle avoidance
             self.obstacle_clearance_reward = 1.0  # Reward for keeping distance from obstacles
         else:
@@ -231,9 +221,7 @@ class DronePPOEnv(DFlexEnv):
 
         # pack for record
         self.hyper_parameter = {
-            "up_strength": self.up_strength,  # Reward for staying upright
             "heading_strength": self.heading_strength,  # Reward for yaw alignment
-            "lin_strength": self.lin_strength,  # Reward for linear velocity alignment
             "obstacle_clearance_reward": self.obstacle_clearance_reward,  # Reward for obstacle distance
             "obst_collision_limit": self.obst_collision_limit,  # Distance threshold for collision
             "action_reward": self.action_reward,  # Reward for smaller actions
@@ -244,7 +232,6 @@ class DronePPOEnv(DFlexEnv):
             "height_stability_reward": self.height_stability_reward,  # Reward for stable altitude
             "sim_dt": self.dt,  # Simulation timestep
             "waypoint_strength": self.waypoint_strength,  # Reward for reaching waypoints
-            "smoothness_reward": self.smoothness_reward,  # Reward for smooth operation
             "map_center_reward": self.map_center_reward,  # Reward for staying near center
             "in_bounds_reward": self.in_bounds_reward,  # Reward for staying within map
             "yaw_strength": self.yaw_strength,  # Reward for yaw stability

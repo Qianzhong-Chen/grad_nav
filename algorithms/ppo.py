@@ -431,7 +431,6 @@ class PPO:
                         "VAE_loss": self.vae_loss,
                         "episode_length": mean_episode_length,
                         "value_loss":self.value_loss,
-                        "actor_loss": self.actor_loss,
                         "value_grad_norm": torch.norm(torch.cat([p.grad.view(-1) for p in self.critic.parameters()])),
                         "actor_grad_norm": torch.norm(torch.cat([p.grad.view(-1) for p in self.actor.parameters()])),
                         })
