@@ -6,7 +6,7 @@ params:
     MM_caching_frequency: 16
 
   network:
-    actor: ActorStochasticMLP # ActorStochasticMLP, ActorDeterministicMLP
+    actor: ActorStochasticMLP # [ActorStochasticMLP, ActorDeterministicMLP]
     actor_mlp:
       units: [512, 256, 128]
       activation: elu
@@ -22,28 +22,26 @@ params:
     decoder_units: [32, 64, 128, 256]
 
   env_hyper:
-    VLM_FEATURE_SIZE: 512
     SINGLE_VISUAL_INPUT_SIZE: 16
     HISTORY_BUFFER_NUM: 5
     LATENT_VECT_NUM: 24
 
   config:
     name: drone_long_traj
-    map_name: gate_right # [gate_mid, gate_right]
+    map_name: gate_mid # [gate_mid, gate_right]
     actor_learning_rate: 1e-4 # adam
     critic_learning_rate: 1e-4 # adam
     vae_learning_rate: 5e-4
     vel_net_learning_rate: 5e-4
     lr_schedule: cosine # ['constant', 'linear', 'cosine']
     target_critic_alpha: 0.2
-    curriculum: False
     obs_rms: True
     ret_rms: False
     critic_iterations: 16
     critic_method: td-lambda # ['td-lambda', 'one-step']
     lambda: 0.95 
     num_batch: 4
-    gamma: 0.99 # 0.99
+    gamma: 0.99 
     betas: [0.7, 0.95] # adam
     steps_num: 32
     grad_norm: 1.0

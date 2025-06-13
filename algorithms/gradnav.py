@@ -97,7 +97,6 @@ class GradNav:
             self.env.domain_randomization = True
         
         self.target_critic_alpha = cfg['params']['config'].get('target_critic_alpha', 0.4)
-        self.curriculum = cfg['params']['config'].get('curriculum', False)
         self.obs_rms = None
         if cfg['params']['config'].get('obs_rms', False):
             self.obs_rms = RunningMeanStd(shape = (self.num_obs), device = self.device)
@@ -179,9 +178,7 @@ class GradNav:
         self.vae_encoder_dim = cfg["params"]["vae"].get("encoder_units", [256, 256, 256])
         self.vae_decoder_dim = cfg["params"]["vae"].get("decoder_units", [32, 64, 128, 256])
         self.vae = VAE(self.num_obs, self.num_history, self.num_latent, kld_weight=self.kl_weight, activation='elu', decoder_hidden_dims=self.vae_decoder_dim, encoder_hidden_dims=self.vae_encoder_dim).to(self.device)
-        self.kl_weight = cfg["params"]["vae"].get("kl_weight", 1.0)
-        self.velo_weight = cfg["params"]["vae"].get("velo_weight", 1.0)
-        
+
 
         if cfg['params']['general']['train']:
             self.save('init_policy')
@@ -251,7 +248,7 @@ class GradNav:
         rew_acc = torch.zeros((self.steps_num + 1, self.num_envs), dtype = torch.float32, device = self.device)
         gamma = torch.ones(self.num_envs, dtype = torch.float32, device = self.device)
         next_values = torch.zeros((self.steps_num + 1, self.num_envs), dtype = torch.float32, device = self.device)
-        
+
         actor_loss = torch.tensor(0., dtype = torch.float32, device = self.device)
         vae_loss = torch.tensor(0., dtype = torch.float32, device = self.device)
         mean_recons_loss = 0
@@ -309,9 +306,7 @@ class GradNav:
             self.obs_hist_buf = history_obs
 
             # update VAE
-            self.time_report.start_timer("VAE training")
             recons_loss, kld_loss, vae_loss_grad = self.compute_vae_loss(obs, vel_obs, history_obs, done)
-            self.time_report.end_timer("VAE training")
             mean_kld_loss = mean_kld_loss + kld_loss
             mean_recons_loss = mean_recons_loss + recons_loss
             vae_loss = vae_loss + vae_loss_grad
@@ -418,14 +413,24 @@ class GradNav:
         self.vae_loss = mean_recons_loss + self.kl_weight * mean_kld_loss
         self.step_count += self.steps_num * self.num_envs
 
-        return actor_loss
+        return actor_loss, vae_loss
     
+    def vae_update(self, vae_loss):
+        self.time_report.start_timer("VAE training")
+        self.vae_optimizer.zero_grad()
+        vae_loss.backward()
+        nn.utils.clip_grad_norm_(self.vae.parameters(), self.grad_norm)
+        self.vae_optimizer.step()
+        self.time_report.end_timer("VAE training")
+
     def compute_vae_loss(self, obs, vel_obs, history_obs, done):
+        self.time_report.start_timer("VAE training")
         vae_loss_dict = self.vae.loss_fn(history_obs.clone().detach(), obs.clone().detach())
         valid = (done == 0).squeeze()
         vae_loss = torch.mean(vae_loss_dict['loss'][valid])
         recons_loss = torch.mean(vae_loss_dict['recons_loss'][valid])
         kld_loss = torch.mean(vae_loss_dict['kld_loss'][valid]) 
+        self.time_report.end_timer("VAE training")
         return recons_loss.item(), kld_loss.item(), vae_loss
     
     
@@ -550,7 +555,7 @@ class GradNav:
             self.time_report.start_timer("compute actor loss")
 
             self.time_report.start_timer("forward simulation")
-            actor_loss = self.compute_actor_loss()
+            actor_loss, vae_loss = self.compute_actor_loss()
             self.time_report.end_timer("forward simulation")
 
             self.time_report.start_timer("backward simulation")
@@ -570,6 +575,7 @@ class GradNav:
                     raise ValueError
 
             self.time_report.end_timer("compute actor loss")
+            self.vae_update(vae_loss)
 
             return actor_loss
 
@@ -584,10 +590,18 @@ class GradNav:
             "num_players": self.env.num_envs,
             }
         self.hyper_parameter.update(train_parameter)
-        wandb.init(
-            project=f'{self.env.agent_name}-{self.map_name}',
-            config=self.hyper_parameter
-        )
+
+        self.wandb_start = False
+        try:
+            wandb.init(
+                project=f'{self.env.agent_name}-{self.map_name}',
+                config=self.hyper_parameter
+            )
+            self.wandb_start = True
+        except Exception as e:
+            print_info(f'wandb init failed: {e}')
+            self.wandb_start = False
+            
 
         # main training process
         for epoch in range(self.max_epochs):
@@ -712,15 +726,16 @@ class GradNav:
             
             # update wandb
             wandb_record_loss = mean_policy_loss
-            wandb.log({"actor loss": wandb_record_loss, 
-                       "VAE_loss": self.vae_loss,
-                       "recons_loss": self.mean_recons_loss,
-                       "kld_loss": self.mean_kld_loss,
-                       "episode_length": mean_episode_length,
-                       "max_grad":self.max_grad,
-                        "mean_grad": self.mean_grad,
-                        "learning rate": actor_lr
-                       })
+            if self.wandb_start:
+                wandb.log({"actor loss": wandb_record_loss, 
+                        "VAE_loss": self.vae_loss,
+                        "recons_loss": self.mean_recons_loss,
+                        "kld_loss": self.mean_kld_loss,
+                        "episode_length": mean_episode_length,
+                        "max_grad":self.max_grad,
+                            "mean_grad": self.mean_grad,
+                            "learning rate": actor_lr
+                        })
 
         self.time_report.end_timer("algorithm")
         self.time_report.report()
