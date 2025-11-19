@@ -33,8 +33,8 @@ params:
     DEPTH_DATA: False
 
   config:
-    name: drone_vlm_2
-    map_name: gate_mid_new # [gate_mid, gate_right, gate_left]
+    name: drone_vla_long_task
+    map_name: gate_mid_new 
     actor_learning_rate: 1e-4 # adam
     critic_learning_rate: 1e-4 # adam
     vae_learning_rate: 1e-4
@@ -56,6 +56,8 @@ params:
     num_actors: 128
     save_interval: 50
     max_epochs: 1000 # total training iterations
+
+    domain_randomization: True
 
     # Low Pass Filter
     LPF_train: True

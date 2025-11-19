@@ -24,7 +24,7 @@ import math
 
 import yaml
 import envs
-import models.actor_vla_mlp
+import models.actor_vla_moe
 import models.critic_vla_mlp
 from utils.common import *
 import utils.torch_utils as tu
@@ -32,9 +32,10 @@ from utils.running_mean_std import RunningMeanStd
 from utils.vlm_dataset import TaskAwareCriticDataset
 from utils.time_report import TimeReport
 from utils.average_meter import AverageMeter
-
 from models.vae import VAE
+
 import wandb
+import matplotlib.pyplot as plt
 torch.autograd.set_detect_anomaly(True)
 
 class BatchLowPassFilter:
@@ -83,6 +84,12 @@ class GradNav:
         self.max_episode_length = self.env.episode_length
         self.device = cfg["params"]["general"]["device"]
 
+        # task shift
+        self.task_shift = cfg['params']['config']['player'].get('task_shift', False)
+        if self.task_shift:
+            self.new_task_id = cfg['params']['config']['player'].get('new_task_id', 0)
+            self.task_shift_time = cfg['params']['config']['player'].get('task_shift_episode', 100)
+
         self.gamma = cfg['params']['config'].get('gamma', 0.99)
         
         self.critic_method = cfg['params']['config'].get('critic_method', 'one-step') # ['one-step', 'td-lambda']
@@ -99,6 +106,7 @@ class GradNav:
         self.init_actor_lr = self.actor_lr
         self.init_critic_lr = self.critic_lr
         self.init_vae_lr = self.vae_lr
+        self.aux_loss_weight = float(cfg['params']['config'].get('aux_loss_weight', 1.0))
         # domain_randomization
         self.domain_randomization = cfg['params']['config'].get('domain_randomization', False)
         if self.domain_randomization:
@@ -172,6 +180,7 @@ class GradNav:
                     del save_cfg['params']['general'][key]
 
             yaml.dump(save_cfg, open(os.path.join(self.log_dir, 'cfg.yaml'), 'w'))
+            # self.writer = SummaryWriter(os.path.join(self.log_dir, 'log'))
             # save interval
             self.save_interval = cfg["params"]["config"].get("save_interval", 500)
             # stochastic inference
@@ -183,9 +192,9 @@ class GradNav:
         # Create actor-critic network
         self.actor_name = cfg["params"]["network"].get("actor", 'ActorStochasticMLP') # choices: ['ActorDeterministicMLP', 'ActorStochasticMLP']
         self.critic_name = cfg["params"]["network"].get("critic", 'CriticMLP')
-        actor_fn = getattr(models.actor_vla_mlp, self.actor_name)
+        actor_fn = getattr(models.actor_vlm_moe, self.actor_name)
         self.actor = actor_fn(self.num_obs, self.num_vlm_feature, self.num_actions, cfg['params']['network'], device = self.device)
-        critic_fn = getattr(models.critic_vla_mlp, self.critic_name)
+        critic_fn = getattr(models.critic_vlm, self.critic_name)
         self.critic = critic_fn(self.num_privilege_obs, self.num_vlm_feature, cfg['params']['network'], device = self.device)
         self.all_params = list(self.actor.parameters()) + list(self.critic.parameters())
         self.target_critic = copy.deepcopy(self.critic)
@@ -193,6 +202,7 @@ class GradNav:
         # VLM special
         self.env.set_task_eval(self.task_id) # only work when num_envs == 1
         self.env.create_saving_folder()
+        self.num_experts = cfg['params']['network']['moe'].get('num_experts', 4)
 
         # creat VAE
         self.num_history = self.env.num_history
@@ -201,7 +211,7 @@ class GradNav:
         self.vae_encoder_dim = cfg["params"]["vae"].get("encoder_units", [256, 256, 256])
         self.vae_decoder_dim = cfg["params"]["vae"].get("decoder_units", [32, 64, 128, 256])
         self.vae = VAE(self.num_obs, self.num_history, self.num_latent, kld_weight=self.kl_weight, activation = 'elu', decoder_hidden_dims = self.vae_decoder_dim, encoder_hidden_dims=self.vae_encoder_dim).to(self.device)
-
+        
 
         if cfg['params']['general']['train']:
             self.save('init_policy')
@@ -266,7 +276,7 @@ class GradNav:
         self.max_grad = 0
         self.mean_grad = 0
 
-
+       
     def fast_log(self, action, raw_obs, norma_obs):
         """Log actions and states to respective files."""
         # action log
@@ -322,7 +332,8 @@ class GradNav:
 
         actor_loss = torch.tensor(0., dtype = torch.float32, device = self.device)
         vae_loss = torch.tensor(0., dtype = torch.float32, device = self.device)
-        # VAE loss only for recording
+        moe_aux_loss = torch.tensor(0., dtype=torch.float32, device=self.device)
+
         mean_recons_loss = 0
         mean_kld_loss = 0
 
@@ -336,8 +347,7 @@ class GradNav:
 
         # initialize trajectory to cut off gradients between episodes.
         obs, privilege_obs, vlm_feature = self.env.initialize_trajectory()
-        # vlm_feature = vlm_feature.detach().clone()
-        vlm_feature = vlm_feature.clone()
+        vlm_feature = vlm_feature.detach().clone()
         if self.obs_rms is not None:
             # update obs rms
             with torch.no_grad():
@@ -359,7 +369,8 @@ class GradNav:
             # LPF
             if self.train_LPF:
                 # Add LPF
-                actions = self.actor(obs, vlm_feature, deterministic=deterministic) 
+                actions, moe_loss_step, _, _ = self.actor(obs, vlm_feature, deterministic=deterministic) 
+                moe_aux_loss = moe_aux_loss + moe_loss_step.mean()
                 actions = torch.tanh(actions)
                 # Apply the LPF (construct a new tensor for filtered actions)
                 filtered_actions = torch.stack([
@@ -371,17 +382,15 @@ class GradNav:
                 # Continue with the rest of your pipeline
                 vae_output, _ = self.vae.forward(self.obs_hist_buf)
                 obs, privilege_obs, history_obs, vel_obs, rew, done, vlm_feature, extra_info = self.env.step(filtered_actions, vae_output) 
-                # vlm_feature = vlm_feature.detach().clone()
-                vlm_feature = vlm_feature.clone()
+                vlm_feature = vlm_feature.detach().clone()
             else:
                 # No LPF
-                actions = self.actor(obs, deterministic = deterministic)
+                actions, moe_loss_step, _, _ = self.actor(obs, deterministic = deterministic)
+                moe_aux_loss = moe_aux_loss + moe_loss_step.mean()
                 vae_output, _ = self.vae.forward(self.obs_hist_buf)
                 obs, privilege_obs, history_obs, vel_obs, rew, done, vlm_feature, extra_info = self.env.step(torch.tanh(actions), vae_output)
-                # vlm_feature = vlm_feature.detach().clone()
-                vlm_feature = vlm_feature.clone()
+                vlm_feature = vlm_feature.detach().clone()
 
-           
             self.obs_hist_buf = history_obs
 
             # update VAE
@@ -389,13 +398,6 @@ class GradNav:
             mean_kld_loss = mean_kld_loss + kld_loss
             mean_recons_loss = mean_recons_loss + recons_loss
             vae_loss = vae_loss + vae_loss_grad
-            
-            # if i % 5 == 0:
-            #     self.time_report.start_timer("VAE training")
-            #     recons_loss, kld_loss = self.vae_closure(obs, vel_obs, history_obs, done)
-            #     self.time_report.end_timer("VAE training")
-            #     mean_recons_loss += recons_loss
-            #     mean_kld_loss += kld_loss
             
             with torch.no_grad():
                 raw_rew = rew.clone()
@@ -502,6 +504,7 @@ class GradNav:
 
         actor_loss /= self.steps_num * self.num_envs
         vae_loss /= self.steps_num 
+        moe_aux_loss /= self.steps_num
         mean_recons_loss /= self.steps_num
         mean_kld_loss /= self.steps_num
 
@@ -518,8 +521,9 @@ class GradNav:
         if torch.isnan(actor_loss):
             print('nan')
 
-        return actor_loss, vae_loss
+        return actor_loss, vae_loss, moe_aux_loss
     
+   
     def vae_update(self, vae_loss):
         self.vae_optimizer.zero_grad()
         vae_loss.backward()
@@ -544,9 +548,13 @@ class GradNav:
         episode_length = torch.zeros(self.num_envs, dtype = int)
         episode_gamma = torch.ones(self.num_envs, dtype = torch.float32, device = self.device)
         episode_discounted_loss = torch.zeros(self.num_envs, dtype = torch.float32, device = self.device)
+       
         obs, vlm_feature = self.env.reset()
 
         games_cnt = 0
+        self.top_k_id_his = []
+        self.top_k_scores_his = []
+
 
         while games_cnt < num_games:
             raw_obs = obs.clone()
@@ -555,7 +563,10 @@ class GradNav:
             
             if self.eval_LPF:
                 # Add LPF
-                actions = self.actor(obs, vlm_feature, deterministic=deterministic)
+                actions, moe_loss_step, top_k_id, top_k_scores = self.actor(obs, vlm_feature, deterministic=deterministic)
+                if num_games == 1:
+                    self.top_k_id_his.append(top_k_id.clone().cpu())
+                    self.top_k_scores_his.append(top_k_scores.clone().cpu())
                 actions = torch.tanh(actions)
                 # Apply the LPF
                 actions[:, 0] = self.eval_r_filter.filter(actions[:, 0])
@@ -563,16 +574,15 @@ class GradNav:
                 actions[:, 2] = self.eval_y_filter.filter(actions[:, 2])
                 actions[:, 3] = self.eval_thrust_filter.filter(actions[:, 3])
 
-                # log action and observation
-                if self.log_flag:
-                    self.fast_log(np.around(actions.clone().cpu().numpy(),3), np.around(raw_obs.clone().cpu().numpy(),3), np.around(obs.clone().cpu().numpy(),3))
-
                 # Continue with the rest of your pipeline
                 vae_output, _ = self.vae.forward(self.obs_hist_buf)
                 obs, privilege_obs, history_obs, vel_obs, rew, done, vlm_feature, extra_info = self.env.step(actions, vae_output)
             else:
                 # No LPF
-                actions = self.actor(obs, deterministic = deterministic)
+                actions, moe_loss_step, top_k_id, top_k_scores = self.actor(obs, deterministic = deterministic)
+                if num_games == 1:
+                    self.top_k_id_his.append(top_k_id.clone().cpu())
+                    self.top_k_scores_his.append(top_k_scores.clone().cpu())
                 vae_output, _ = self.vae.forward(self.obs_hist_buf)
                 obs, privilege_obs, history_obs, vel_obs, rew, done, vlm_feature, extra_info = self.env.step(torch.tanh(actions), vae_output)
             
@@ -600,8 +610,99 @@ class GradNav:
         mean_episode_length = np.mean(np.array(episode_length_his))
         mean_policy_loss = np.mean(np.array(episode_loss_his))
         mean_policy_discounted_loss = np.mean(np.array(episode_discounted_loss_his))
+
+        if self.log_flag and num_games == 1:
+            self.plot_moe_loading()
  
         return mean_policy_loss, mean_policy_discounted_loss, mean_episode_length
+
+    @torch.no_grad()
+    # only consider num_actors==1
+    def evaluate_policy_task_shift(self, num_games, deterministic = False):
+        episode_length_his = []
+        episode_loss_his = []
+        episode_discounted_loss_his = []
+        episode_loss = torch.zeros(self.num_envs, dtype = torch.float32, device = self.device)
+        episode_length = torch.zeros(self.num_envs, dtype = int)
+        episode_gamma = torch.ones(self.num_envs, dtype = torch.float32, device = self.device)
+        episode_discounted_loss = torch.zeros(self.num_envs, dtype = torch.float32, device = self.device)
+       
+        obs, vlm_feature = self.env.reset()
+
+        games_cnt = 0
+        self.top_k_id_his = []
+        self.top_k_scores_his = []
+
+
+        while games_cnt < num_games:
+            raw_obs = obs.clone()
+            if self.obs_rms is not None:
+                obs = self.obs_rms.normalize(obs)
+
+            if self.task_shift_time == self.env.progress_buf[0].item():
+                self.prev_task = self.env.task_list[0]
+                self.env.task_list[0] = list(self.env.task_table.keys())[self.new_task_id]
+                print_info(f"at episode {self.task_shift_time}: Task changed from {self.prev_task} to {self.env.task_list[0]}")
+            
+            if self.eval_LPF:
+                # Add LPF
+                actions, moe_loss_step, top_k_id, top_k_scores = self.actor(obs, vlm_feature, deterministic=deterministic)
+                if num_games == 1:
+                    self.top_k_id_his.append(top_k_id.clone().cpu())
+                    self.top_k_scores_his.append(top_k_scores.clone().cpu())
+                actions = torch.tanh(actions)
+                # Apply the LPF
+                actions[:, 0] = self.eval_r_filter.filter(actions[:, 0])
+                actions[:, 1] = self.eval_p_filter.filter(actions[:, 1])
+                actions[:, 2] = self.eval_y_filter.filter(actions[:, 2])
+                actions[:, 3] = self.eval_thrust_filter.filter(actions[:, 3])
+
+                # log action and observation
+                # if self.log_flag:
+                #     self.fast_log(np.around(actions.clone().cpu().numpy(),3), np.around(raw_obs.clone().cpu().numpy(),3), np.around(obs.clone().cpu().numpy(),3))
+
+                # Continue with the rest of your pipeline
+                vae_output, _ = self.vae.forward(self.obs_hist_buf)
+                obs, privilege_obs, history_obs, vel_obs, rew, done, vlm_feature, extra_info = self.env.step(actions, vae_output)
+            else:
+                # No LPF
+                actions, moe_loss_step, top_k_id, top_k_scores = self.actor(obs, deterministic = deterministic)
+                if num_games == 1:
+                    self.top_k_id_his.append(top_k_id.clone().cpu())
+                    self.top_k_scores_his.append(top_k_scores.clone().cpu())
+                vae_output, _ = self.vae.forward(self.obs_hist_buf)
+                obs, privilege_obs, history_obs, vel_obs, rew, done, vlm_feature, extra_info = self.env.step(torch.tanh(actions), vae_output)
+            
+            self.obs_hist_buf = history_obs
+
+            episode_length += 1
+
+            done_env_ids = done.nonzero(as_tuple = False).squeeze(-1)
+
+            episode_loss -= rew
+            episode_discounted_loss -= episode_gamma * rew
+            episode_gamma *= self.gamma
+            if len(done_env_ids) > 0:
+                for done_env_id in done_env_ids:
+                    print('loss = {:.2f}, len = {}'.format(episode_loss[done_env_id].item(), episode_length[done_env_id]))
+                    episode_loss_his.append(episode_loss[done_env_id].item())
+                    episode_discounted_loss_his.append(episode_discounted_loss[done_env_id].item())
+                    episode_length_his.append(episode_length[done_env_id].item())
+                    episode_loss[done_env_id] = 0.
+                    episode_discounted_loss[done_env_id] = 0.
+                    episode_length[done_env_id] = 0
+                    episode_gamma[done_env_id] = 1.
+                    games_cnt += 1
+        
+        mean_episode_length = np.mean(np.array(episode_length_his))
+        mean_policy_loss = np.mean(np.array(episode_loss_his))
+        mean_policy_discounted_loss = np.mean(np.array(episode_discounted_loss_his))
+
+        if self.log_flag and num_games == 1:
+            self.plot_moe_loading()
+ 
+        return mean_policy_loss, mean_policy_discounted_loss, mean_episode_length
+
 
     @torch.no_grad()
     def compute_target_values(self):
@@ -618,7 +719,7 @@ class GradNav:
                 self.target_values[i] = (1.0 - self.lam) * Ai + lam * Bi
         else:
             raise NotImplementedError
-            
+   
 
     def compute_critic_loss(self, batch_sample):
         state_obs = batch_sample['obs']
@@ -636,9 +737,12 @@ class GradNav:
 
     @torch.no_grad()
     def run(self, num_games):
-        mean_policy_loss, mean_policy_discounted_loss, mean_episode_length = self.evaluate_policy(num_games = num_games, deterministic = not self.stochastic_evaluation)
+        if self.task_shift:
+            mean_policy_loss, mean_policy_discounted_loss, mean_episode_length = self.evaluate_policy_task_shift(num_games = num_games, deterministic = not self.stochastic_evaluation)
+        else:
+            mean_policy_loss, mean_policy_discounted_loss, mean_episode_length = self.evaluate_policy(num_games = num_games, deterministic = not self.stochastic_evaluation)
         print_info('mean episode loss = {}, mean discounted loss = {}, mean episode length = {}'.format(mean_policy_loss, mean_policy_discounted_loss, mean_episode_length))
-
+        
 
     def train(self):
         self.log_flag = False
@@ -653,7 +757,6 @@ class GradNav:
         self.time_report.add_timer("actor training")
         self.time_report.add_timer("critic training")
         self.time_report.add_timer("VAE training")
-
         self.time_report.start_timer("algorithm")
 
         # initializations
@@ -663,6 +766,7 @@ class GradNav:
         # self.episode_length = torch.zeros(self.num_envs, dtype = int)
         self.episode_length = torch.zeros(self.num_envs, dtype = int, device = self.device)
         self.episode_gamma = torch.ones(self.num_envs, dtype = torch.float32, device = self.device)
+        self.moe_aux_loss = 0.0
         
         def actor_closure():
             self.actor_optimizer.zero_grad()
@@ -670,11 +774,13 @@ class GradNav:
             self.time_report.start_timer("compute actor loss")
 
             self.time_report.start_timer("forward simulation")
-            actor_loss, vae_loss = self.compute_actor_loss()
+            actor_loss, vae_loss, moe_aux_loss = self.compute_actor_loss()
+            self.moe_aux_loss = moe_aux_loss.detach().cpu().item()
             self.time_report.end_timer("forward simulation")
 
             self.time_report.start_timer("backward simulation")
-            actor_loss.backward()
+            total_actor_loss = actor_loss + self.aux_loss_weight * moe_aux_loss
+            total_actor_loss.backward()
             self.time_report.end_timer("backward simulation")
 
             with torch.no_grad():
@@ -731,7 +837,7 @@ class GradNav:
                         next_map_name = self.env.multi_map[curr_map_ptr]
                     self.initialize_env()
                     self.env.change_map(next_map_name)
-                    self.actor_optimizer = torch.optim.AdamW(self.actor.parameters(), betas = [0.7, 0.95], lr = self.actor_lr, weight_decay=5e-3)
+                    self.actor_optimizer = torch.optim.AdamW(self.actor.parameters(), betas = [0.7, 0.95], lr = self.actor_lr, weight_decay=1e-2)
                     print_info(f'map has been changed to {next_map_name}, actor lr reset to {self.actor_lr}')
 
 
@@ -829,8 +935,8 @@ class GradNav:
                 mean_policy_discounted_loss = np.inf
                 mean_episode_length = 0
 
-            print('iter {}: ep loss {:.2f}, ep discounted loss {:.2f}, vae loss {:.2f}, ep len {:.1f}, fps total {:.2f}, value loss {:.2f}, grad norm before clip {:.2f}, grad norm after clip {:.2f}'.format(\
-                    self.iter_count, mean_policy_loss, mean_policy_discounted_loss, self.vae_loss, mean_episode_length, self.steps_num * self.num_envs / (time_end_epoch - time_start_epoch), self.value_loss, self.grad_norm_before_clip, self.grad_norm_after_clip))
+            print('iter {}: ep loss {:.2f}, ep discounted loss {:.2f}, vae loss {:.2f}, moe aux loss {:.2f}, ep len {:.1f}, fps total {:.2f}, value loss {:.2f}, grad norm before clip {:.2f}, grad norm after clip {:.2f}'.format(\
+                    self.iter_count, mean_policy_loss, mean_policy_discounted_loss, self.vae_loss, self.moe_aux_loss, mean_episode_length, self.steps_num * self.num_envs / (time_end_epoch - time_start_epoch), self.value_loss, self.grad_norm_before_clip, self.grad_norm_after_clip))
 
             # self.writer.flush()
         
@@ -854,8 +960,8 @@ class GradNav:
                        "kld_loss": self.mean_kld_loss,
                        "episode_length": mean_episode_length,
                        "max_grad":self.max_grad,
-                        "mean_grad": self.mean_grad,
-                        "learning rate": actor_lr
+                       "mean_grad": self.mean_grad,
+                       "learning rate": actor_lr
                        })
 
         self.time_report.end_timer("algorithm")
@@ -878,43 +984,26 @@ class GradNav:
         ckpt_dir = os.path.dirname(ckpt_path)
         self.load(cfg['params']['general']['checkpoint'])
         # log system
-        self.log_flag = False # TODO: fix the log system for new recording saving methods 
-        if self.log_flag:
-            self.log_dir = os.path.join(self.env.save_path, "fast_log")
-            os.makedirs(self.log_dir, exist_ok=True)
-            self.filename_action = os.path.join(self.log_dir, "fast_action_record.txt")
-            self.filename_raw_obs = os.path.join(self.log_dir, "fast_raw_obs_record.txt")
-            self.filename_norm_obs = os.path.join(self.log_dir, "fast_normalized_obs_record.txt")
+        self.log_flag = True 
         self.run(cfg['params']['config']['player']['num_actors'])
 
+    
     def save(self, filename = None):
         if filename is None:
             filename = 'best_policy'
-        if hasattr(self.env, 'vlm'):
-            torch.save([
-                        self.actor, 
-                        self.critic, 
-                        self.target_critic, 
-                        self.obs_rms, 
-                        self.vae, 
-                        self.env.visual_net,
-                        self.env.vlm.img_proj,
-                        self.env.vlm.txt_proj,
-                        self.env.vlm.fc,
-                        ], os.path.join(self.log_dir, "{}.pt".format(filename)))
-        else:
-            torch.save([
-                        self.actor, 
-                        self.critic, 
-                        self.target_critic, 
-                        self.obs_rms, 
-                        self.vae, 
-                        self.env.visual_net,
-                        None,
-                        None,
-                        None,
-                        ], os.path.join(self.log_dir, "{}.pt".format(filename)))
+        torch.save([
+                    self.actor, 
+                    self.critic, 
+                    self.target_critic, 
+                    self.obs_rms, 
+                    self.vae, 
+                    self.env.visual_net,
+                    self.env.vlm.img_proj,
+                    self.env.vlm.txt_proj,
+                    self.env.vlm.fc,
+                    ], os.path.join(self.log_dir, "{}.pt".format(filename)))
     
+
     def load(self, path):
         print(path)
         checkpoint = torch.load(path)
@@ -934,3 +1023,69 @@ class GradNav:
             self.env.vlm.fc = checkpoint[8].to(self.device)
         print_info(f"all nets have been loaded")
 
+    
+
+    def plot_moe_loading(self):
+        if not hasattr(self, "top_k_id_his") or not hasattr(self, "top_k_scores_his"):
+            print("MoE logging data is missing.")
+            return
+
+        if len(self.top_k_id_his) == 0 or len(self.top_k_scores_his) == 0:
+            print("No MoE usage or scores recorded.")
+            return
+
+        # Stack top-k id and score history
+        top_k_id_tensor = torch.stack(self.top_k_id_his, dim=0)         # [T, B, K]
+        top_k_scores_tensor = torch.stack(self.top_k_scores_his, dim=0) # [T, B, K]
+
+        steps, num_envs, top_k = top_k_id_tensor.shape
+        num_experts = self.num_experts
+
+        # Initialize expert score matrix: [steps, num_experts]
+        expert_score_matrix = np.zeros((steps, num_experts), dtype=np.float32)
+
+        for t in range(steps):
+            ids = top_k_id_tensor[t].reshape(-1).cpu().numpy()       # shape: [B*K]
+            scores = top_k_scores_tensor[t].reshape(-1).cpu().numpy()  # shape: [B*K]
+
+            for idx, expert_id in enumerate(ids):
+                expert_score_matrix[t, expert_id] += scores[idx]
+
+            # Average if an expert was used multiple times
+            counts = np.bincount(ids, minlength=num_experts)
+            for i in range(num_experts):
+                if counts[i] > 0:
+                    expert_score_matrix[t, i] /= counts[i]
+                else:
+                    expert_score_matrix[t, i] = 0.0  # explicitly set to 0
+
+        # === Plot Expert Score Over Time ===
+        plt.figure(figsize=(10, 6))
+        for expert_id in range(num_experts):
+            plt.plot(expert_score_matrix[:, expert_id], label=f'Expert {expert_id}')
+        plt.xlabel('Step')
+        plt.ylabel('Average Gate Score')
+        plt.title('Per-Expert Gate Score Over Time')
+        plt.legend()
+        plt.grid(True)
+
+        save_dir = self.env.save_path[0]
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, 'moe_topk_scores_over_time.png')
+        plt.savefig(save_path)
+        plt.close()
+
+        if self.task_shift:
+            with open(os.path.join(save_dir, 'task_overview.txt'), 'a', encoding='utf-8') as f:
+                f.write(f"Task shift time: {self.task_shift_time}\n")
+                f.write(f"Task shift from: {self.prev_task}\n")
+
+        # save moe loading score
+        np.save(os.path.join(save_dir, 'moe_topk_scores.npy'), expert_score_matrix)
+        
+
+
+
+        
+
+    

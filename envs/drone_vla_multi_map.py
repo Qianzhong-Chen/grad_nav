@@ -34,7 +34,6 @@ from utils.point_cloud_util import ObstacleDistanceCalculator
 from utils.traj_planner_vla import TrajectoryPlanner
 from utils.hist_obs_buffer import ObsHistBuffer
 from utils.time_report import TimeReport
-import time
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -42,7 +41,7 @@ from models.clip import VLM
 from models.squeeze_net import VisualPerceptionNet
 
 
-class DroneVLALongTaskEnv(DFlexEnv):
+class DroneVLAMultiMapEnv(DFlexEnv):
     def __init__(self, 
                  render=False, 
                  device='cuda:0', 
@@ -57,8 +56,8 @@ class DroneVLALongTaskEnv(DFlexEnv):
                  eval_task_id=0,
                  env_hyper=None,
                  ):
-
-        self.agent_name = 'drone_vla_long_task'
+        
+        self.agent_name = 'drone_vlm_multi_map'
         self.num_history = env_hyper.get('HISTORY_BUFFER_NUM', 5)
         self.num_latent = env_hyper.get('LATENT_VECT_NUM', 24)
         self.vlm_feature_dim = env_hyper.get('VLM_FEATURE_SIZE', 256)
@@ -71,7 +70,7 @@ class DroneVLALongTaskEnv(DFlexEnv):
         
     
         print('----------------------------', device)
-        super(DroneVLALongTaskEnv, self).__init__(num_envs, num_obs, num_act, episode_length, MM_caching_frequency, seed, no_grad, render, device)
+        super(DroneVLAMultiMapEnv, self).__init__(num_envs, num_obs, num_act, episode_length, MM_caching_frequency, seed, no_grad, render, device)
         self.stochastic_init = stochastic_init
         self.early_termination = early_termination
         self.device = device
@@ -82,10 +81,13 @@ class DroneVLALongTaskEnv(DFlexEnv):
         self.time_report.add_timer("VLM inference")
 
         # setup map
-        maps = {
-            "gate_mid_new": "gate_mid_new",
+        self.map_lib = {
+            "gate_left":"sv_917_3_left_nerfstudio",
+            "gate_mid":"sv_1007_gate_mid",
         }
         self.map_name = map_name
+        self.multi_map = ["gate_left", "gate_mid"]
+        self.multi_map_num = len(self.multi_map)
 
         # SysID value
         self.min_mass = 1.0
@@ -103,30 +105,34 @@ class DroneVLALongTaskEnv(DFlexEnv):
 
         # GS model
         gs_dir = Path("assets/gs_data")
-        resolution_quality = 0.4
-        self.gs = get_gs(self.map_name, gs_dir, resolution_quality)
+        self.resolution_quality = 0.4
+        self.gs = get_gs(self.map_name, gs_dir, self.resolution_quality)
 
         self.init_sim()
         self.episode_length = episode_length
 
         # navigation parameters
-        if self.map_name == 'gate_mid_new':
+        if self.map_name == 'gate_mid':
             target = (13.0, -2.0, 1.5) # in map absolute dimension, start with 0
             target_xy = (13.0, -2.0)
+        elif self.map_name == 'gate_left':
+            target = (13.0, -2.0, 1.2) # in map absolute dimension, start with 0
+            target_xy = (13.0, -2.0)
         else:
-            raise ValueError(f"Unknown map name: {self.map_name}")
+            raise ValueError(f"Unsupported map name: {self.map_name}")
         
         self.target = tu.to_torch(list(target), 
             device=self.device, requires_grad=True).repeat((self.num_envs, 1)) # navigation target
         self.target_xy = tu.to_torch(list(target_xy), 
             device=self.device, requires_grad=True).repeat((self.num_envs, 1)) # navigation target
+        # self.target_list = self.target.clone()
         self.gs_origin_offset = torch.tensor([[-6.0, -0., -0.05]] * self.num_envs, device=self.device) # (x,y,z); gs dimension for visual info
         self.point_could_origin_offset = torch.tensor([[-6.0, -0., -0.05]] * self.num_envs, device=self.device) # (x,y,z); point cloud dimension for obstacle distance & traj plan
 
         # setup point cloud
         script_dir = Path(__file__).parent
         point_cloud_dir = script_dir / "assets" / "point_cloud"
-        ply_file = point_cloud_dir / f"{maps[self.map_name]}.ply"
+        ply_file = point_cloud_dir / f"{self.map_lib[self.map_name]}.ply"
         self.point_cloud = ObstacleDistanceCalculator(ply_file=ply_file)
         self.traj_planner = TrajectoryPlanner(ply_file=ply_file, 
                                             safety_distance=0.15, 
@@ -136,161 +142,37 @@ class DroneVLALongTaskEnv(DFlexEnv):
         
 
         # generate ref_traj
-        if self.map_name == 'gate_mid_new':
-            traj_start = torch.tensor([[-6.0, 0.0, 1.4]], device=self.device)
-            self.wp_num = 3
-            self.ref_traj_size = 20
-            self.task_table = {
-                # Training tasks
-                "[Task 0] Go straight through the gate then STOP over MONITOR": [torch.tensor([ # x, y, z
-                                                                [2.0, 0.2, 1.4],
-                                                                [5.8, 0.2, 1.4],
-                                                                [6.5, -1.0, 1.6],
-                                                                ], device=self.device)
-                                                    ],
-                "[Task 1] Go straight through the gate then FLY to LADDER base": [torch.tensor([ # x, y, z
-                                                                [2.0, 0.2, 1.4],
-                                                                [5.8, 0.2, 1.4],
-                                                                [6.5, 1.2, 0.8],
-                                                                ], device=self.device)
-                                                    ],
-                "[Task 2] FLY passed the RIGHT side of the gate then FLY to LADDER base": [torch.tensor([ # x, y, z
-                                                                [2.5, -0.6, 1.35],
-                                                                [5.0, -1.4, 1.4],
-                                                                [8.0, 0.9, 1.1],
-                                                                ], device=self.device)
-                                                    ],
-                "[Task 3] FLY passed the RIGHT side of the gate then STOP over CART": [torch.tensor([ # x, y, z
-                                                                [2.5, -0.6, 1.4],
-                                                                [5.0, -1.3, 1.4],
-                                                                [10.5, 0.2, 1.7],
-                                                                ], device=self.device)
-                                                    ],
-                "[Task 4] FLY passed the LEFT side of the gate then STOP over MONITOR": [torch.tensor([
-                                                                [2.5, 0.8, 1.35],
-                                                                [5.5, 1.8, 1.4],
-                                                                [8.5, -0.6, 1.6],
-                                                                ], device=self.device)
-                                                    ],
-                "[Task 5] FLY passed the LEFT side of the gate then STOP over CART": [torch.tensor([
-                                                                [2.5, 0.8, 1.35],
-                                                                [4.5, 1.8, 1.4],
-                                                                [10.0, -0.5, 1.7],
-                                                                ], device=self.device)
-                                                    ],
-                "[Task 6] FLY ABOVE the gate then FLY to LADDER base": [torch.tensor([
-                                                                [4.0, 0.2, 2.2],
-                                                                [5.9, 0.2, 2.5],
-                                                                [8.0, 1.0, 1.5],
-                                                                ], device=self.device)
-                                                    ],
-                "[Task 7] FLY ABOVE the gate then STOP over MONITOR": [torch.tensor([
-                                                                [4.0, 0.2, 2.2],
-                                                                [5.9, 0.2, 2.5],
-                                                                [9.0, -1.0, 1.6],
-                                                                ], device=self.device)
-                                                    ],
-
-                # # # Evaluation tasks
-                # "[Task 8] GO THROUGH the gate. The gate must be passed. Go straight through the gate → STOP over CART": [torch.tensor([ # x, y, z
-                #                                                 [2.0, 0.2, 1.4],
-                #                                                 [5.8, 0.2, 1.4],
-                #                                                 [10.5, 0.2, 1.7],
-                #                                                 ], device=self.device)
-                #                                     ],
-                # "[Task 9] FLY passed the RIGHT side of the gate. Fly next to the right side of the gate. Pass the gate from the right → STOP over MONITOR": [torch.tensor([ # x, y, z
-                #                                                 [2.5, -0.7, 1.4],
-                #                                                 [5.0, -1.5, 1.4],
-                #                                                 [8.5, -1.0, 1.6],
-                #                                                 ], device=self.device)
-                #                                     ],
-                # "[Task 10] FLY passed the LEFT side of the gate. Fly next to the left side of the gate. Pass the gate from the left → FLY to LADDER base": [torch.tensor([
-                #                                                 [2.5, 0.6, 1.35],
-                #                                                 [4.5, 1.6, 1.4],
-                #                                                 [8.0, 1.0, 0.8],
-                #                                                 ], device=self.device)
-                #                                     ],
-                # "[Task 11] FLY ABOVE the gate. The gate is below. Fly directly over the gate → STOP over CART": [torch.tensor([
-                #                                                 [4.0, 0.2, 2.1],
-                #                                                 [5.9, 0.2, 2.4],
-                #                                                 [10.5, 0.2, 1.7],
-                #                                                 ], device=self.device)
-                #                                     ],
-            }
-            
-        else:
-            raise ValueError(f"Unknown map name: {self.map_name}")
-        
-        # Generate reference trajectory
-        for key, value in self.task_table.items():
-            reward_wp = value[0]
-            traj_wp = reward_wp + self.point_could_origin_offset[0].repeat((reward_wp.shape[0],1))
-            traj_start = torch.tensor([[-6.0, 0, 1.4]], device=self.device)
-            self.task_table[key].append(torch.tensor(self.traj_planner.plan_trajectories(traj_start, 
-                                                                                            [traj_wp], 
-                                                                                            des_wp_num=self.ref_traj_size)[0], 
-                                                    device=self.device))
-
-       
-        # Multitask training simultaneously preparation
-        task_names = list(self.task_table.keys())
-        self.task_num = len(task_names)
         self.eval_task_id = eval_task_id
-        if self.num_envs == 1:
-            self.ini_task_indices = torch.tensor([self.eval_task_id], device=self.device)
-        else:
-            self.ini_task_indices = torch.randint(0, self.task_num, (self.num_envs,))
+        self.configure_tasks(self.map_name)
         
-        self.task_list = [task_names[i] for i in self.ini_task_indices]
-        self.reward_wp_tensor = torch.zeros((self.num_envs, self.wp_num, 3), device=self.device)
-        self.ref_traj_tensor = torch.zeros((self.num_envs, self.ref_traj_size, 3), device=self.device)
-
-        # Fill in waypoints based on task_list
-        for i in range(self.num_envs):
-            task_name = self.task_list[i]
-            wp = self.task_table[task_name][0]  
-            ref_traj = self.task_table[task_name][1] 
-            self.reward_wp_tensor[i] = wp
-            self.ref_traj_tensor[i] = ref_traj
-
-        
-        # TODO: implement a better way to handle the reward waypoints
-        self.reward_wp_record = []
-        for i in range(self.wp_num):
-            self.reward_wp_record.append(torch.zeros(self.num_envs, dtype=torch.bool, device=self.device))
         
         # Reward parameters
-        if self.map_name == 'gate_mid_new':
-            self.up_strength = 0.25
-            self.heading_strength = 0.3 # reward yaw motion align with lin_vel
-            self.lin_strength = -0.5
-            self.lin_vel_rate_penalty = -0.75
-            self.action_penalty = -1.0
-            self.action_change_penalty = -1.0
-            self.smooth_penalty = -0.75
-            self.survive_reward = 8.0
-            self.pose_penalty = -0.5
-            self.height_penalty = -1.5
-            self.height_change_penalty = -0.5
-            self.jitter_penalty = -0.1
-            self.out_map_penalty = -1.5
-            self.map_center_penalty = -0.05
-            # trajectory
-            self.waypoint_strength = 4.0
-            self.target_factor = -4.0
-            # obstacle avoidance
-            self.obstacle_strength = 1.0
-            self.collision_penalty_coef = 0.0
-            self.collision_penalty = self.collision_penalty_coef*self.survive_reward 
-        else:
-            raise ValueError(f"Unknown map name: {self.map_name}")
-        
-       
+        self.up_strength = 0.25
+        self.heading_strength = 0.25 # reward yaw motion align with lin_vel
+        self.lin_strength = -0.5
+        self.lin_vel_rate_penalty = -0.75
+        self.action_penalty = -1.0
+        self.action_change_penalty = -1.25
+        self.smooth_penalty = -1.0
+        self.survive_reward = 8.0
+        self.pose_penalty = -0.5
+        self.height_penalty = -2.0
+        self.height_change_penalty = -0.5
+        self.jitter_penalty = -0.1
+        self.out_map_penalty = -1.5
+        self.map_center_penalty = -0.05
+        # trajectory
+        self.waypoint_strength = 4.0
+        self.target_factor = -4.0
+        # obstacle avoidance
+        self.obstacle_strength = 1.0
+        self.collision_penalty_coef = 0.0
+        self.collision_penalty = self.collision_penalty_coef*self.survive_reward 
+
         self.obst_threshold = 0.5
         self.obst_collision_limit = 0.20
         self.body_rate_threshold = 15
         self.domain_randomization = False
-
 
         # self.dt = 0.05 # outter loop RL policy freaquency
         self.map_limit_fact = 1.25
@@ -310,9 +192,9 @@ class DroneVLALongTaskEnv(DFlexEnv):
         #-----------------------
         # Set up visual perception net
         if self.use_depth:
-            self.visual_net = VisualPerceptionNet(input_channels=1, visual_feature_size=self.visual_feature_size).to(self.device)
+            self.visual_net = None
         else:
-            self.visual_net = VisualPerceptionNet(input_channels=3, visual_feature_size=self.visual_feature_size).to(self.device)
+            self.visual_net = VisualPerceptionNet(input_channels=3, visual_feature_dim=self.visual_feature_size).to(self.device)
         self.vlm = VLM(self.num_envs, self.device, vlm_feature_size=self.vlm_feature_dim).to(self.device)
         self.obs_hist_buf = ObsHistBuffer(batch_size=self.num_envs,
                                           vector_dim=self.num_latent_obs,
@@ -349,7 +231,7 @@ class DroneVLALongTaskEnv(DFlexEnv):
             "mass_range": self.mass_range,
             "min_thrust": self.min_thrust,
             "min_thrust": self.thrust_range,
-            "resolution_quality": resolution_quality,
+            "resolution_quality": self.resolution_quality,
             "br_delay_factor": self.br_delay_factor,
             "thrust_delay_factor":self.thrust_delay_factor,
             "start_height": self.start_height,
@@ -384,15 +266,137 @@ class DroneVLALongTaskEnv(DFlexEnv):
         self.done_record = np.zeros([self.task_num])
         self.reward_record = torch.zeros([self.task_num], device=self.device)
 
+    def change_map(self, map_name):
+        assert map_name in list(self.map_lib.keys())
+        self.map_name = map_name
+
+        # Load 3D GS
+        gs_dir = Path("assets/gs_data")
+        self.gs = get_gs(self.map_name, gs_dir, self.resolution_quality)
+        self.configure_tasks(self.map_name)
+
 
         
+    def configure_tasks(self, map_name):
+        # generate ref_traj
+        if map_name == 'gate_mid':
+            traj_start = torch.tensor([[-6.0, 0.0, 1.4]], device=self.device)
+            self.wp_num = 3
+            self.ref_traj_size = 20
+
+            self.task_table = {
+                "[Task 0]: GO THROUGH gate": [torch.tensor([ # x, y, z
+                                                                [2.0, -0.2, 1.3],
+                                                                [5.8, -0.3, 1.4],
+                                                                [7.0, -0.4, 1.3],
+                                                                ], device=self.device)
+                                                    ],
+                "[Task 1]: FLY passed the RIGHT side of the gate": [torch.tensor([ # x, y, z
+                                                                [3.0, -1.2, 1.3],
+                                                                [5.0, -2.3, 1.3],
+                                                                [7.5, -1.0, 1.4],
+                                                                ], device=self.device)
+                                                    ],
+                "[Task 2]: FLY passed the LEFT side of the gate": [torch.tensor([
+                                                                [2.0, 1.2, 1.3],
+                                                                [5.0, 1.8, 1.4],
+                                                                [7.5, 0.9, 1.1],
+                                                                ], device=self.device)
+                                                    ],
+                "[Task 3]: FLY ABOVE gate": [torch.tensor([
+                                                                [4.0, 0.0, 2.1],
+                                                                [5.0, -0.1, 2.4],
+                                                                [7.5, -0.5, 1.9],
+                                                                ], device=self.device)
+                                                    ],
+            }
+
+        elif map_name == 'gate_left':
+            traj_start = torch.tensor([[-6.0, 0.0, 1.4]], device=self.device)
+            self.wp_num = 3
+            self.ref_traj_size = 20
+            self.task_table = {
+                "[Task 0]: GO THROUGH gate": [torch.tensor([ # x, y, z
+                                                                [2.0, 0.7, 1.3],
+                                                                [5.8, 0.8, 1.4],
+                                                                [7.0, 0.8, 1.4],
+                                                                ], device=self.device)
+                                                    ],
+                "[Task 1]: FLY passed the RIGHT side of the gate": [torch.tensor([ # x, y, z
+                                                                [3.0, -0.0, 1.3],
+                                                                [6.0, -0.6, 1.4],
+                                                                [8.0, -0.6, 1.4],
+                                                                ], device=self.device)
+                                                    ],
+                "[Task 2]: FLY passed the LEFT side of the gate": [torch.tensor([
+                                                                [3.0, 0.9, 1.3],
+                                                                [5.5, 2.0, 1.4],
+                                                                [7.5, 1.5, 1.4],
+                                                                ], device=self.device)
+                                                    ],
+                "[Task 3]: FLY ABOVE gate": [torch.tensor([
+                                                                [4.0, 0.7, 2.1],
+                                                                [5.5, 0.8, 2.4],
+                                                                [7.5, 0.8, 1.6],
+                                                                ], device=self.device)
+                                                    ],
+            }
+                
+        else:
+            raise ValueError(f"Unsupported map name: {map_name}")
+        
+        # setup point cloud
+        script_dir = Path(__file__).parent
+        point_cloud_dir = script_dir / "assets" / "point_cloud"
+        ply_file = point_cloud_dir / f"{self.map_lib[self.map_name]}.ply"
+        self.point_cloud = ObstacleDistanceCalculator(ply_file=ply_file)
+        self.traj_planner = TrajectoryPlanner(ply_file=ply_file, 
+                                            safety_distance=0.15, 
+                                            batch_size=1, 
+                                            wp_distance=2.0,
+                                            verbose=False)
+
+        for key, value in self.task_table.items():
+            reward_wp = value[0]
+            traj_wp = reward_wp + self.point_could_origin_offset[0].repeat((reward_wp.shape[0],1))
+            traj_start = torch.tensor([[-6.0, 0, 1.4]], device=self.device)
+            self.task_table[key].append(torch.tensor(self.traj_planner.plan_trajectories(traj_start, 
+                                                                                            [traj_wp], 
+                                                                                            des_wp_num=self.ref_traj_size)[0], 
+                                                    device=self.device))
+            
+        # Multitask training simultaneously preparation
+        task_names = list(self.task_table.keys())
+        self.task_num = len(task_names)
+        if self.num_envs == 1:
+            self.ini_task_indices = torch.tensor([self.eval_task_id], device=self.device)
+        else:
+            self.ini_task_indices = torch.randint(0, self.task_num, (self.num_envs,))
+        
+        self.task_list = [task_names[i] for i in self.ini_task_indices]
+        self.reward_wp_tensor = torch.zeros((self.num_envs, self.wp_num, 3), device=self.device)
+        self.ref_traj_tensor = torch.zeros((self.num_envs, self.ref_traj_size, 3), device=self.device)
+
+        # Fill in waypoints based on task_list
+        for i in range(self.num_envs):
+            task_name = self.task_list[i]
+            wp = self.task_table[task_name][0]  
+            ref_traj = self.task_table[task_name][1] 
+            self.reward_wp_tensor[i] = wp
+            self.ref_traj_tensor[i] = ref_traj
+
+        self.reward_wp_record = []
+        for i in range(self.wp_num):
+            self.reward_wp_record.append(torch.zeros(self.num_envs, dtype=torch.bool, device=self.device))
+        
+
         
     def create_saving_folder(self):
         if (self.visualize):
             curr_path = os.getcwd()
             if self.num_envs == 1:
                 self.save_indices = [0]
-                self.save_path = [f'{curr_path}/examples/outputs/{self.agent_name}/{self.actor_nn_name}/{self.map_name}/NLP/task_{self.eval_task_id}/{self.time_stamp}_individual_eval']
+                self.save_path = [f'{curr_path}/examples/outputs/{self.agent_name}/{self.actor_nn_name}/{self.map_name}/NLP/task_{self.eval_task_id}/{self.time_stamp}']
             else:
                 self.select_eval_indices()
                 self.save_path = []
@@ -415,10 +419,7 @@ class DroneVLALongTaskEnv(DFlexEnv):
                 raise ValueError("Not enough indices to assign to all tasks.")
             
 
-
-
     def init_sim(self):
-        # self.builder = df.sim.ModelBuilder()
         self.builder = ModelBuilder()
         self.dt = 0.05 # outter loop RL policy freaquency
         self.sim_dt = self.dt
@@ -431,10 +432,13 @@ class DroneVLALongTaskEnv(DFlexEnv):
         self.y_unit_tensor = tu.to_torch([0, 1, 0], dtype=torch.float, device=self.device, requires_grad=False).repeat((self.num_envs, 1))
         self.z_unit_tensor = tu.to_torch([0, 0, 1], dtype=torch.float, device=self.device, requires_grad=False).repeat((self.num_envs, 1))
 
-        if self.map_name == 'gate_mid_new':
+        if self.map_name == 'gate_mid':
+            self.start_rot = np.array([0., 0., 0., 1.]) # (x,y,z,w)
+        elif self.map_name == 'gate_left':
             self.start_rot = np.array([0., 0., 0., 1.]) # (x,y,z,w)
         else:
-            raise ValueError(f"Unknown map name: {self.map_name}")
+            raise ValueError(f"Unsupported map name: {self.map_name}")
+        
         self.start_rotation = tu.to_torch(self.start_rot, device=self.device, requires_grad=False)
 
         # initialize some data used later on
@@ -466,12 +470,14 @@ class DroneVLALongTaskEnv(DFlexEnv):
             br_noise_std=0.01,  # Scalar
         )
         
-        # set start pos
-        if self.map_name == 'gate_mid_new':
+        if self.map_name == 'gate_mid':
+            start_pos_x = 0.0; start_pos_y = -0.0
+            self.start_body_rate = [0., 0., 0.]
+        if self.map_name == 'gate_left':
             start_pos_x = 0.0; start_pos_y = 0.0
             self.start_body_rate = [0., 0., 0.]
         else:
-            raise ValueError(f"Unknown map name: {self.map_name}")
+            raise ValueError(f"Unsupported map name: {self.map_name}")
 
         self.start_pos = []
         self.start_norm_thrust = [(self.hover_thrust / self.max_thrust).clone().detach().cpu().numpy()[0]]
@@ -480,6 +486,7 @@ class DroneVLALongTaskEnv(DFlexEnv):
         
 
         for i in range(self.num_environments):
+            # start_pos_y = i*self.env_dist
             start_pos = [start_pos_x, start_pos_y, self.start_height, ]
             self.start_pos.append(start_pos)
 
@@ -597,16 +604,15 @@ class DroneVLALongTaskEnv(DFlexEnv):
 
         env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
 
-        if self.no_grad == False:
-            self.obs_buf_before_reset = self.obs_buf.clone()
-            self.privilege_obs_buf_before_reset = self.privilege_obs_buf.clone()
-            self.vlm_feature_before_reset = self.vlm_feature.clone()
-            self.extras = {
-                'obs_before_reset': self.obs_buf_before_reset,
-                'privilege_obs_before_reset': self.privilege_obs_buf_before_reset,
-                'episode_end': self.termination_buf,
-                "vlm_feature_before_reset": self.vlm_feature_before_reset,
-                }
+        self.obs_buf_before_reset = self.obs_buf.clone()
+        self.privilege_obs_buf_before_reset = self.privilege_obs_buf.clone()
+        self.vlm_feature_before_reset = self.vlm_feature.clone()
+        self.extras = {
+            'obs_before_reset': self.obs_buf_before_reset,
+            'privilege_obs_before_reset': self.privilege_obs_buf_before_reset,
+            'episode_end': self.termination_buf,
+            "vlm_feature_before_reset": self.vlm_feature_before_reset,
+            }
 
         if len(env_ids) > 0:
            self.reset(env_ids)
@@ -631,6 +637,7 @@ class DroneVLALongTaskEnv(DFlexEnv):
         if env_ids is not None:
             num_reset_envs = len(env_ids)
             if not self.visualize and self.domain_randomization:
+                # Randomize mass, max_thrust, and inertia for the specified environments
                 mass_with_noise = torch.rand(num_reset_envs, device=self.device) * self.mass_range + self.min_mass  # Uniform noise between 1.0 to 1.2
                 self.mass[env_ids] = mass_with_noise
                 max_thrust_with_noise = torch.rand(num_reset_envs, device=self.device) * self.thrust_range + self.min_thrust  # Uniform noise between 24 and 26
@@ -846,7 +853,6 @@ class DroneVLALongTaskEnv(DFlexEnv):
             raise ValueError(f"Unknown noise mode: {mode}")
         
 
-
     def calculateObservations(self):
         torso_pos = self.state_joint_q.view(self.num_envs, -1)[:, 0:3]
         torso_quat = self.state_joint_q.view(self.num_envs, -1)[:, 3:7] # (x,y,z,w)
@@ -876,7 +882,7 @@ class DroneVLALongTaskEnv(DFlexEnv):
 
 
         if not self.visualize:
-            # Nerf info processing
+            # 3DGS info processing
             if self.nerf_count % self.nerf_freq == 0: # infer nerf every nerf_freq steps
                 self.time_report.start_timer("3D GS inference")
                 depth_list, nerf_img = self.gs.render(gs_pose) # (batch_size,H,W,1/3)
@@ -887,10 +893,6 @@ class DroneVLALongTaskEnv(DFlexEnv):
         # Draw record plot for data visualization
         if self.visualize:
             img_transform = Resize((360, 640), antialias=True)
-
-            # ---------------------------------------
-            # Normal test mode
-            # 3DGS data
             depth_list, nerf_img = self.gs.render(gs_pose) # (batch_size,H,W,1/3)
             self.process_GS_data(depth_list, nerf_img)
 
@@ -1027,8 +1029,7 @@ class DroneVLALongTaskEnv(DFlexEnv):
         # State related rewards
         lin_vel_reward = self.lin_strength * torch.sum(torch.square(self.obs_buf[:, 14:17]), dim=-1) 
         velo_rate_penalty = torch.sum(torch.square(self.prev_lin_vel - self.obs_buf[:, 14:17]), dim=-1) * self.lin_vel_rate_penalty
-        # pose_penalty = torch.sum(torch.abs(self.obs_buf[:, 2:6] - self.start_rotation), dim=-1) * self.pose_penalty
-        pose_penalty = torch.sum(torch.square(self.obs_buf[:, 2:6] - self.start_rotation), dim=-1) * self.pose_penalty
+        pose_penalty = torch.sum(torch.abs(self.obs_buf[:, 2:6] - self.start_rotation), dim=-1) * self.pose_penalty
         height_penalty = torch.square(self.obs_buf[:,0] - self.target_height) * self.height_penalty
         height_change_penalty = torch.square(self.obs_buf[:,1]) * self.height_change_penalty
         jitter_penalty = torch.square(self.privilege_obs_buf[:,8]) * self.jitter_penalty 
@@ -1141,9 +1142,9 @@ class DroneVLALongTaskEnv(DFlexEnv):
             # Save the task instruction and final reward in txt
             task_name = self.task_list[map_id]
             final_reward = self.reward_record[i]
-            with open(f'{save_path}/task_overview.txt', 'w', encoding='utf-8') as f:
+            with open(f'{save_path}/task_overview.txt', 'w') as f:
                 f.write(f'Task: {task_name}\n')
-                f.write(f'Final loss: {final_reward}\n')
+                f.write(f'Final loss: {final_reward}\n') 
 
             # Save raw data
             np.save(f'{save_path}/x.npy', np.array(self.x_record[i], dtype=object), allow_pickle=True)

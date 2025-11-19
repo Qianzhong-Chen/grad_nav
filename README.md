@@ -1,7 +1,8 @@
 <div align="center">
 
+# GRaD-Nav Series
 
-# GRaD-Nav: Learning Visual Drone Navigation with Gaussian Radiance Fields and Differentiable Dynamics
+## [IROS 2025] GRaD-Nav: Learning Visual Drone Navigation with Gaussian Radiance Fields and Differentiable Dynamics
 
 
 [Project Page](https://qianzhong-chen.github.io/gradnav.github.io/) | [Video](https://www.youtube.com/watch?v=ySCSm8eJLyY&t=3s) | [Arxiv](https://arxiv.org/abs/2503.03984)
@@ -10,6 +11,21 @@
 
 <div align="center">
   <img src="envs/assets/grad_nav_project.jpg" style="width:80%" />
+</div>
+
+---
+
+
+<div align="center">
+
+## [RA-L 2025] GRaD-Nav++: Vision-Language Model Enabled Visual Drone Navigation with Gaussian Radiance Fields and Differentiable Dynamics
+
+[Project Page](https://qianzhong-chen.github.io/gradnavpp.github.io/) | [Video](https://youtu.be/Wlur_iNw-H8) | [Arxiv](https://www.arxiv.org/abs/2506.14009)
+
+</div>
+
+<div align="center">
+  <img src="envs/assets/grad_nav_pp.png" style="width:80%" />
 </div>
 
 ---
@@ -31,9 +47,10 @@
   pip install gsplat
   ```
 
-- Install gym
+- Install gym and transformers
   ```
   pip install gym
+  pip install transformers
   ```
 
 ## Data Download and Setup
@@ -60,7 +77,18 @@
   ```
   python examples/train_gradnav.py --cfg examples/cfg/gradnav/drone_multi_gate.yaml --logdir examples/logs/DroneMultiGate/gradnav
   ```
-### 2. Baselines
+
+### 2. GRaD-Nav++:
+- GRaD-Nav VLA long task training:
+  ```
+  python examples/train_gradnav_vla_moe.py --cfg examples/cfg/gradnav_vla_moe/drone_long_task.yaml --logdir examples/logs/DroneVLALongTaskEnv/gradnav_MoE
+  ```
+- GRaD-Nav VLA multi map training:
+  ```
+  python examples/train_gradnav_vla_moe.py --cfg examples/cfg/gradnav_vla_moe/drone_multi_map.yaml --logdir examples/logs/DroneVLAMultiMapEnv/gradnav_MoE
+  ```
+
+### 3. Baselines
 - PPO long trajectory training:
   ```
   python examples/train_ppo.py --cfg examples/cfg/ppo/drone_ppo.yaml --logdir examples/logs/DronePPO/ppo
@@ -75,24 +103,43 @@
 
 ## Testing
 ### 1. GRaD-Nav:
-- GRaD-Nav long trajectory training:
+- GRaD-Nav long trajectory testing:
   ```
   python examples/train_gradnav.py --cfg examples/cfg/gradnav/drone_long_traj.yaml --checkpoint examples/logs/DroneLongTraj/gradnav/<map_name>/<time_stamp>/best_policy.pt --play --render
   ```
-- GRaD-Nav multi-gate training:
+- GRaD-Nav multi-gate testing:
   ```
   python examples/train_gradnav.py --cfg examples/cfg/gradnav/drone_multi_gate.yaml --checkpoint examples/logs/DroneMultiGate/gradnav/<map_name>/<time_stamp>/best_policy.pt --play --render
   ```
-### 2. Baselines
-- PPO long trajectory training:
+
+### 2. GRaD-Nav++:
+- GRaD-Nav VLA long task testing single task (changing task in drone_long_task.yaml):
+  ```
+  python examples/train_gradnav_vla_moe.py --cfg examples/cfg/gradnav_vla_moe/drone_long_task.yaml --checkpoint examples/logs/DroneVLALongTaskEnv/gradnav_MoE/<map_name>/<time_stamp>/final_policy.pt --play --render
+  ```
+- GRaD-Nav VLA long task testing all tasks:
+  ```
+  python auto_test_vla_long_task_moe.py --checkpoint examples/logs/DroneVLALongTaskEnv/gradnav_MoE/<map_name>/<time_stamp>/final_policy.pt --play --render
+  ```
+- GRaD-Nav VLA multi map testing single task (changing task in drone_multi_map.yaml):
+  ```
+  python examples/train_gradnav_vla_moe.py --cfg examples/cfg/gradnav_vla_moe/drone_multi_map.yaml --checkpoint examples/logs/DroneVLAMultiMapEnv/gradnav_MoE/<map_name>/<time_stamp>/final_policy.pt --play --render
+  ```
+- GRaD-Nav VLA multi map testing all tasks:
+  ```
+  python auto_test_vla_multi_map_moe.py --checkpoint examples/logs/DroneVLAMultiMapEnv/gradnav_MoE/<map_name>/<time_stamp>/final_policy.pt --play --render
+  ```
+
+### 3. Baselines
+- PPO long trajectory testing:
   ```
   python examples/train_ppo.py --cfg examples/cfg/ppo/drone_ppo.yaml --checkpoint examples/logs/DronePPO/ppo/<map_name>/<time_stamp>/best_policy.pt --play --render
   ```
-- BPTT long trajectory training:
+- BPTT long trajectory testing:
   ```
   python examples/train_bptt.py --cfg examples/cfg/bptt/drone_long_traj.yaml --checkpoint examples/logs/DroneLongTraj/bptt/<map_name>/<time_stamp>/best_policy.pt --play --render
   ```
-### 3. Test results
+### 4. Test results
 - Simulation results can be found at `examples/outputs/<env_name>/<map_name>/<time_stamp>/`
 
 ## Citation
@@ -108,4 +155,13 @@ If you find our paper or code is useful, please consider citing:
         primaryClass={cs.RO},
         url={https://arxiv.org/abs/2503.03984}, 
     }
+```
+
+```kvk
+  @article{chen2025grad,
+    title={GRaD-Nav++: Vision-Language Model Enabled Visual Drone Navigation with Gaussian Radiance Fields and Differentiable Dynamics},
+    author={Chen, Qianzhong and Gao, Naixiang and Huang, Suning and Low, JunEn and Chen, Timothy and Sun, Jiankai and Schwager, Mac},
+    journal={arXiv preprint arXiv:2506.14009},
+    year={2025}
+}
 ```

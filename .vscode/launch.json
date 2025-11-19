@@ -109,10 +109,10 @@
             "name": "Train GRaD-Nav VLA long task MLP",
             "type": "python",
             "request": "launch",
-            "program": "${workspaceFolder}/examples/train_gradnav_vla_long_task_mlp.py",
+            "program": "${workspaceFolder}/examples/train_gradnav_vla_mlp.py",
             "args": [
-                "--cfg", "examples/cfg/gradnav_vla/drone_long_task.yaml",
-                "--logdir", "examples/logs/DroneVLALongTaskEnv/gradnav/MLP",
+                "--cfg", "examples/cfg/gradnav_vla_mlp/drone_long_task.yaml",
+                "--logdir", "examples/logs/DroneVLALongTaskEnv/gradnav_MLP",
             ],
             "console": "integratedTerminal"
         },
@@ -120,10 +120,85 @@
             "name": "Test GRaD-Nav VLA long task MLP",
             "type": "python",
             "request": "launch",
-            "program": "${workspaceFolder}/examples/train_gradnav_vla_long_task_mlp.py",
+            "program": "${workspaceFolder}/examples/train_gradnav_vla_mlp.py",
             "args": [
-                "--cfg", "examples/cfg/gradnav_vla/drone_long_task.yaml",
-                "--logdir", "examples/logs/DroneVLALongTaskEnv/gradnav/MLP",
+                "--cfg", "examples/cfg/gradnav_vla_mlp/drone_long_task.yaml",
+                "--logdir", "examples/logs/DroneVLALongTaskEnv/gradnav_MLP",
+                "--play",
+                "--render"
+            ],
+            "console": "integratedTerminal"
+        },
+
+        {
+            "name": "Train GRaD-Nav VLA multi map MLP",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_gradnav_vla_mlp.py",
+            "args": [
+                "--cfg", "examples/cfg/gradnav_vla_mlp/drone_multi_map.yaml",
+                "--logdir", "examples/logs/DroneVLAMultiMapEnv/gradnav_MLP",
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Test GRaD-Nav VLA multi map MLP",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_gradnav_vla_mlp.py",
+            "args": [
+                "--cfg", "examples/cfg/gradnav_vla_mlp/drone_multi_map.yaml",
+                "--logdir", "examples/logs/DroneVLAMultiMapEnv/gradnav_MLP",
+                "--play",
+                "--render"
+            ],
+            "console": "integratedTerminal"
+        },
+
+        {
+            "name": "Train GRaD-Nav VLA long task MoE",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_gradnav_vla_moe.py",
+            "args": [
+                "--cfg", "examples/cfg/gradnav_vla_moe/drone_long_task.yaml",
+                "--logdir", "examples/logs/DroneVLALongTaskEnv/gradnav_MoE",
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Test GRaD-Nav VLA long task MoE",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_gradnav_vla_moe.py",
+            "args": [
+                "--cfg", "examples/cfg/gradnav_vla_moe/drone_long_task.yaml",
+                "--logdir", "examples/logs/DroneVLALongTaskEnv/gradnav_MoE",
+                "--play",
+                "--render"
+            ],
+            "console": "integratedTerminal"
+        },
+
+        {
+            "name": "Train GRaD-Nav VLA multi map MoE",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_gradnav_vla_moe.py",
+            "args": [
+                "--cfg", "examples/cfg/gradnav_vla_moe/drone_multi_map.yaml",
+                "--logdir", "examples/logs/DroneVLAMultiMapEnv/gradnav_MoE",
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Test GRaD-Nav VLA multi map MoE",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_gradnav_vla_moe.py",
+            "args": [
+                "--cfg", "examples/cfg/gradnav_vla_moe/drone_multi_map.yaml",
+                "--logdir", "examples/logs/DroneVLAMultiMapEnv/gradnav_MoE",
                 "--play",
                 "--render"
             ],
