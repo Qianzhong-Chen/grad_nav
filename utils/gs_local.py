@@ -138,6 +138,7 @@ def get_gs(map: str, gs_path, resolution) -> 'GS':
         "gate_left": "sv_917_3_left_nerfstudio",
         "gate_right": "sv_917_3_right_nerfstudio",
         "gate_mid": "sv_1007_gate_mid",
+        "gate_mid_new": "gate_mid_new",
     }
 
     map_folder = os.path.join(gs_data_root, maps[map])
