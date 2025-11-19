@@ -14,7 +14,7 @@ sys.path.append(project_dir)
 import argparse
 
 import envs
-import algorithms.gradnav_vla_moe as gradnav_vlm
+import algorithms.gradnav_vla_moe as gradnav_vla
 import os
 import sys
 import yaml
@@ -108,7 +108,7 @@ if __name__ == '__main__':
     for key in vargs.keys():
         cfg_train["params"]["general"][key] = vargs[key]
 
-    traj_optimizer = gradnav_vlm.GradNav(cfg_train)
+    traj_optimizer = gradnav_vla.GradNav(cfg_train)
 
     if args.train:
         traj_optimizer.train()

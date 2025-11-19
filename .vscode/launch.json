@@ -124,6 +124,7 @@
             "args": [
                 "--cfg", "examples/cfg/gradnav_vla_mlp/drone_long_task.yaml",
                 "--logdir", "examples/logs/DroneVLALongTaskEnv/gradnav_MLP",
+                "--checkpoint", "examples/logs/DroneVLALongTaskEnv/gradnav_MLP/<MAP_NAME>/<TIME_STAMP>/final_policy.pt",
                 "--play",
                 "--render"
             ],
@@ -149,6 +150,7 @@
             "args": [
                 "--cfg", "examples/cfg/gradnav_vla_mlp/drone_multi_map.yaml",
                 "--logdir", "examples/logs/DroneVLAMultiMapEnv/gradnav_MLP",
+                "--checkpoint", "examples/logs/DroneVLAMultiMapEnv/gradnav_MLP/<MAP_NAME>/<TIME_STAMP>/final_policy.pt",
                 "--play",
                 "--render"
             ],
@@ -174,6 +176,7 @@
             "args": [
                 "--cfg", "examples/cfg/gradnav_vla_moe/drone_long_task.yaml",
                 "--logdir", "examples/logs/DroneVLALongTaskEnv/gradnav_MoE",
+                "--checkpoint", "examples/logs/DroneVLALongTaskEnv/gradnav_MoE/<MAP_NAME>/<TIME_STAMP>/final_policy.pt",
                 "--play",
                 "--render"
             ],
@@ -199,6 +202,7 @@
             "args": [
                 "--cfg", "examples/cfg/gradnav_vla_moe/drone_multi_map.yaml",
                 "--logdir", "examples/logs/DroneVLAMultiMapEnv/gradnav_MoE",
+                "--checkpoint", "examples/logs/DroneVLAMultiMapEnv/gradnav_MoE/<MAP_NAME>/<TIME_STAMP>/final_policy.pt",
                 "--play",
                 "--render"
             ],

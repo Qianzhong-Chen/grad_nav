@@ -1,6 +1,6 @@
 params:
   diff_env:
-    name: DroneVLAMultiMapEnv
+    name: DroneVLALongTaskEnv
     stochastic_env: True
     episode_length: 500
     MM_caching_frequency: 16
