@@ -59,7 +59,7 @@ class DroneVLALongTaskEnv(DFlexEnv):
                  env_hyper=None,
                  ):
 
-        self.agent_name = 'drone_vlm'
+        self.agent_name = 'drone_vla_long_task'
         self.num_history = env_hyper.get('HISTORY_BUFFER_NUM', 5)
         self.num_latent = env_hyper.get('LATENT_VECT_NUM', 24)
         self.vlm_feature_dim = env_hyper.get('VLM_FEATURE_SIZE', 256)
