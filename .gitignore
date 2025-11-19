@@ -29,7 +29,7 @@ examples/wandb/*
 nerf_install/nerfstudio.egg-info/
 
 
-*.png
+# *.png
 *.mp4
 *.ninja
 *.obj
