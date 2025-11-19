@@ -9,6 +9,7 @@ from envs.dflex_env import DFlexEnv
 from envs.drone_long_traj import DroneLongTrajEnv
 from envs.drone_ppo import DronePPOEnv
 from envs.drone_multi_gate import DroneMultiGateEnv
+from envs.drone_vla_long_task import DroneVLALongTaskEnv
 
 
 

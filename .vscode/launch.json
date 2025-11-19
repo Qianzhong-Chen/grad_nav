@@ -104,6 +104,32 @@
             "console": "integratedTerminal"
         },
 
+        // ===== GRaD-Nav++ ====
+        {
+            "name": "Train GRaD-Nav VLA long task MLP",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_gradnav_vla_long_task_mlp.py",
+            "args": [
+                "--cfg", "examples/cfg/gradnav_vla/drone_long_task.yaml",
+                "--logdir", "examples/logs/DroneVLALongTaskEnv/gradnav/MLP",
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Test GRaD-Nav VLA long task MLP",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_gradnav_vla_long_task_mlp.py",
+            "args": [
+                "--cfg", "examples/cfg/gradnav_vla/drone_long_task.yaml",
+                "--logdir", "examples/logs/DroneVLALongTaskEnv/gradnav/MLP",
+                "--play",
+                "--render"
+            ],
+            "console": "integratedTerminal"
+        },
+
     
     ]
 }
