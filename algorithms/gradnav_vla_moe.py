@@ -192,9 +192,9 @@ class GradNav:
         # Create actor-critic network
         self.actor_name = cfg["params"]["network"].get("actor", 'ActorStochasticMLP') # choices: ['ActorDeterministicMLP', 'ActorStochasticMLP']
         self.critic_name = cfg["params"]["network"].get("critic", 'CriticMLP')
-        actor_fn = getattr(models.actor_vlm_moe, self.actor_name)
+        actor_fn = getattr(models.actor_vla_moe, self.actor_name)
         self.actor = actor_fn(self.num_obs, self.num_vlm_feature, self.num_actions, cfg['params']['network'], device = self.device)
-        critic_fn = getattr(models.critic_vlm, self.critic_name)
+        critic_fn = getattr(models.critic_vla_mlp, self.critic_name)
         self.critic = critic_fn(self.num_privilege_obs, self.num_vlm_feature, cfg['params']['network'], device = self.device)
         self.all_params = list(self.actor.parameters()) + list(self.critic.parameters())
         self.target_critic = copy.deepcopy(self.critic)

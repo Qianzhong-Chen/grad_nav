@@ -194,7 +194,7 @@ class DroneVLAMultiMapEnv(DFlexEnv):
         if self.use_depth:
             self.visual_net = None
         else:
-            self.visual_net = VisualPerceptionNet(input_channels=3, visual_feature_dim=self.visual_feature_size).to(self.device)
+            self.visual_net = VisualPerceptionNet(input_channels=3, visual_feature_size=self.visual_feature_size).to(self.device)
         self.vlm = VLM(self.num_envs, self.device, vlm_feature_size=self.vlm_feature_dim).to(self.device)
         self.obs_hist_buf = ObsHistBuffer(batch_size=self.num_envs,
                                           vector_dim=self.num_latent_obs,
@@ -473,7 +473,7 @@ class DroneVLAMultiMapEnv(DFlexEnv):
         if self.map_name == 'gate_mid':
             start_pos_x = 0.0; start_pos_y = -0.0
             self.start_body_rate = [0., 0., 0.]
-        if self.map_name == 'gate_left':
+        elif self.map_name == 'gate_left':
             start_pos_x = 0.0; start_pos_y = 0.0
             self.start_body_rate = [0., 0., 0.]
         else:
