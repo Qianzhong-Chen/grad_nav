@@ -1,4 +1,4 @@
-params:  
+params:
   diff_env:
     name: DroneVLAMultiMapEnv
     stochastic_env: True
@@ -6,19 +6,29 @@ params:
     MM_caching_frequency: 16
 
   network:
-    actor: TaskAwareActor # ActorDeterministicMLP
+    actor: TaskAwareMoEActor
     actor_mlp:
-      'obs_units': [1024, 512, 256]     # MLP for proprioception
-      'vlm_units': [1024, 512, 256]     # MLP for VLM feature
-      'fusion_units': [512, 256, 128]       # Final fused layer before action output
-      'activation': 'elu'
+      obs_units: [512, 256, 128]     # MLP for proprioception
+      vlm_units: [512, 256, 128]     # MLP for VLM features
+      fusion_units: [256, 128, 64]    # Final fusion before action output
+      activation: elu
+
+    moe:
+      num_experts: 2                 # Number of full-stack experts
+      top_k: 2                       # Use top-k for sparsity and stability
+      dropout: 0.1                   # Optional (currently unused)
+      lambda_balance: 10.0
+      lambda_entropy: 0.1
+      gate_mlp:
+        units: [256, 128, 64]
+        activation: elu
 
     critic: TaskAwareCriticMLP
     critic_mlp:
-      'obs_units': [1024, 512, 256]       # MLP for proprioception
-      'vlm_units': [1024, 512, 256]       # MLP for VLM feature
-      'fusion_units': [512, 256, 128]      # Final fused layer before action output
-      'activation': 'elu'
+      obs_units: [512, 256, 128] 
+      vlm_units: [512, 256, 128]
+      fusion_units: [256, 128, 64]
+      activation: elu
 
   vae:
     kl_weight: 1.0
@@ -30,39 +40,39 @@ params:
     SINGLE_VISUAL_INPUT_SIZE: 32
     HISTORY_BUFFER_NUM: 5
     LATENT_VECT_NUM: 24
-    DEPTH_DATA: False
+    DEPTH_DATA: True
 
   config:
-    name: drone_vla_multi_map
-    map_name: gate_mid # [gate_mid, gate_left]
-    actor_learning_rate: 1e-4 # adam
-    critic_learning_rate: 1e-4 # adam
+    name: drone_vlm_moe
+    map_name: gate_mid
+    actor_learning_rate: 1e-4
+    critic_learning_rate: 1e-4
     vae_learning_rate: 1e-4
     vel_net_learning_rate: 1e-4
-    lr_schedule: cosine # ['constant', 'linear', 'cosine']
-    target_critic_alpha: 0.2
+    lr_schedule: cosine
+    target_critic_alpha: 0.5
+    aux_loss_weight: 0.2 # Importance of MoE auxiliary loss
     curriculum: False
     obs_rms: True
     ret_rms: False
     critic_iterations: 16
-    critic_method: td-lambda # ['td-lambda', 'one-step']
-    lambda: 0.95 # init 0.95
-    num_batch: 4
-    gamma: 0.99 # 0.99
-    betas: [0.7, 0.95] # adam
+    critic_method: td-lambda
+    lambda: 0.95
+    num_batch: 16
+    gamma: 0.99
+    betas: [0.7, 0.95]
     steps_num: 32
     grad_norm: 1.0
     truncate_grads: True
     num_actors: 128
-    save_interval: 100
-    max_epochs: 3000 # total training iterations
+    save_interval: 50
+    max_epochs: 3000
 
     multi_map: True
     map_change_time: 100
 
     domain_randomization: True
 
-    # Low Pass Filter
     LPF_train: True
     LPF_val: 0.5
 
