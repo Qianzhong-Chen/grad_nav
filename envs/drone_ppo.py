@@ -708,7 +708,7 @@ class DronePPOEnv(DFlexEnv):
         targets = self.ref_traj[selected_indices]
         target_list[valid_indices] = targets
         target_list = target_list - self.point_could_origin_offset
-        obst_dist = self.point_cloud.compute_nearest_distances(drone_pos, drone_rot)
+        obst_dist = self.point_cloud.compute_nearest_distances(drone_pos, drone_rot[:,[3,0,1,2]])
 
         desire_velo_norm = (target_list - self.privilege_obs_buf[:, 0:3]) / torch.clamp(torch.norm(target_list - self.privilege_obs_buf[:, 0:3], dim=1, keepdim=True), min=1e-6)
         curr_velo_norm = self.obs_buf[:, 14:17] / torch.clamp(torch.norm(self.obs_buf[:, 14:17], dim=1, keepdim=True), min=1e-2)

@@ -1074,7 +1074,7 @@ class DroneVLAMultiMapEnv(DFlexEnv):
         # Obstacle avoidance reward
         obst_reward = torch.tensor([0.], requires_grad=True, device=self.device)
         self.time_report.start_timer("point cloud collision check")
-        obst_dist = self.point_cloud.compute_nearest_distances(drone_pos, drone_rot)
+        obst_dist = self.point_cloud.compute_nearest_distances(drone_pos, drone_rot[:,[3,0,1,2]])
         self.time_report.end_timer("point cloud collision check")
         # Reward larger distance away from obstacles
         obst_reward = obst_reward + torch.where(obst_dist < self.obst_threshold, obst_dist*self.obstacle_strength, torch.zeros_like(obst_dist))
