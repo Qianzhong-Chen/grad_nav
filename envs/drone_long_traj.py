@@ -126,9 +126,11 @@ class DroneLongTrajEnv(DFlexEnv):
             traj_start = torch.tensor([[-6.0, 0, 1.4]], device=self.device)
             traj_dest = torch.tensor([[7.0, -2.0, 1.4]], device=self.device)
             self.ref_traj = self.traj_planner.plan_trajectories(traj_start, traj_dest, [traj_wp])
+            if self.ref_traj is None or len(self.ref_traj) == 0 or self.ref_traj[0] is None:
+                raise RuntimeError(f"Path planning returned None for map '{self.map_name}': start or dest is likely inside occupied space. Run tools/validate_scene.py to check coordinates before training.")
             self.ref_traj = torch.tensor(self.ref_traj[0], device = self.device)
-            self.target = self.reward_wp[-1].repeat((self.num_envs,1)) 
-            self.target_xy = self.reward_wp[-1, 0:2].repeat((self.num_envs,1)) 
+            self.target = self.reward_wp[-1].repeat((self.num_envs,1))
+            self.target_xy = self.reward_wp[-1, 0:2].repeat((self.num_envs,1))
 
         elif self.map_name == 'gate_right':
             self.reward_wp = torch.tensor([
@@ -144,9 +146,11 @@ class DroneLongTrajEnv(DFlexEnv):
             traj_start = torch.tensor([[-6.0, 0, 1.3]], device=self.device)
             traj_dest = torch.tensor([[7.0, -2.0, 1.3]], device=self.device)
             self.ref_traj = self.traj_planner.plan_trajectories(traj_start, traj_dest, [traj_wp])
+            if self.ref_traj is None or len(self.ref_traj) == 0 or self.ref_traj[0] is None:
+                raise RuntimeError(f"Path planning returned None for map '{self.map_name}': start or dest is likely inside occupied space. Run tools/validate_scene.py to check coordinates before training.")
             self.ref_traj = torch.tensor(self.ref_traj[0], device = self.device)
-            self.target = self.reward_wp[-1].repeat((self.num_envs,1)) 
-            self.target_xy = self.reward_wp[-1, 0:2].repeat((self.num_envs,1)) 
+            self.target = self.reward_wp[-1].repeat((self.num_envs,1))
+            self.target_xy = self.reward_wp[-1, 0:2].repeat((self.num_envs,1))
 
         else:
             raise ValueError(f"Map {self.map_name} is not supported for reward waypoints setup.")
