@@ -6,14 +6,16 @@ import torch
 import time
 
 class TrajectoryPlanner:
-    def __init__(self, ply_file, voxel_size=0.1, safety_distance=0.2, batch_size=1, wp_distance=2.0, verbose=True):
+    def __init__(self, ply_file, voxel_size=0.1, safety_distance=0.2, batch_size=1, wp_distance=2.0, nav_margin=2.0, verbose=True):
         self.verbose = verbose
         self.ply_file = ply_file
         self.voxel_size = voxel_size
         self.safety_distance = safety_distance
+        self.nav_margin = nav_margin
         self.batch_size = batch_size
         self.points = self.load_point_cloud()
-        self.occupancy_grid, self.min_bound = self.create_occupancy_grid()
+        self.occupancy_grid = None
+        self.min_bound = None
         self.trajectory_batches = []
         self.waypoints_list = None  
         self.destination_positions = None  
@@ -26,13 +28,22 @@ class TrajectoryPlanner:
             print("Point cloud loaded with {} points.".format(len(pcd.points)))
         return np.asarray(pcd.points)
 
-    def create_occupancy_grid(self):
-        min_bound = self.points.min(axis=0) - self.safety_distance
-        max_bound = self.points.max(axis=0) + self.safety_distance
+    def create_occupancy_grid(self, nav_points):
+        # Bound the grid to the trajectory region plus a margin, keeping the full cloud lattice
+        origin = self.points.min(axis=0) - self.safety_distance
+        nav_min = nav_points.min(axis=0) - self.nav_margin
+        nav_max = nav_points.max(axis=0) + self.nav_margin
+        lo = np.maximum(np.floor((nav_min - origin) / self.voxel_size).astype(int), 0)
+        min_bound = origin + lo * self.voxel_size
+        max_bound = nav_max
+
+        in_region = np.all((self.points >= min_bound) & (self.points <= max_bound), axis=1)
+        points = self.points[in_region]
+
         grid_shape = np.ceil((max_bound - min_bound) / self.voxel_size).astype(int)
         occupancy_grid = np.zeros(grid_shape, dtype=bool)
 
-        indices = np.floor((self.points - min_bound) / self.voxel_size).astype(int)
+        indices = np.floor((points - min_bound) / self.voxel_size).astype(int)
         occupancy_grid[indices[:, 0], indices[:, 1], indices[:, 2]] = True
 
         # Inflate obstacles by safety distance
@@ -210,6 +221,10 @@ class TrajectoryPlanner:
 
         if not (len(current_positions) == len(destination_positions) == len(self.waypoints_list) == self.batch_size):
             raise ValueError("Input lists must have the same length as batch_size.")
+
+        nav_points = np.vstack([current_positions, destination_positions] + [np.asarray(wp) for wp in self.waypoints_list])
+        self.occupancy_grid, self.min_bound = self.create_occupancy_grid(nav_points)
+
         args_list = []
         for i in range(self.batch_size):
             current_pos = current_positions[i]
